@@ -11,6 +11,7 @@ use crate::{
         ObservedBackendState, SshReadinessProbe, Timestamp, TunnelOwner, TunnelState,
         WakeRequester,
     },
+    scheduler::WarmExecutionScheduler,
 };
 
 #[derive(Clone)]
@@ -18,6 +19,7 @@ pub struct AppState {
     pub config: AppConfig,
     pub backend: Arc<RwLock<BackendStatus>>,
     pub lifecycle: Arc<dyn LifecycleOrchestrator>,
+    pub scheduler: WarmExecutionScheduler,
 }
 
 impl AppState {
@@ -31,11 +33,13 @@ impl AppState {
             SystemClock,
             SharedBackendState::new(backend.clone()),
         ));
+        let scheduler = WarmExecutionScheduler::new(config.warm_execution.clone());
 
         Self {
             config,
             backend,
             lifecycle,
+            scheduler,
         }
     }
 
@@ -45,10 +49,23 @@ impl AppState {
         backend: Arc<RwLock<BackendStatus>>,
         lifecycle: Arc<dyn LifecycleOrchestrator>,
     ) -> Self {
+        let scheduler = WarmExecutionScheduler::new(config.warm_execution.clone());
+
+        Self::with_services(config, backend, lifecycle, scheduler)
+    }
+
+    #[cfg(test)]
+    pub fn with_services(
+        config: AppConfig,
+        backend: Arc<RwLock<BackendStatus>>,
+        lifecycle: Arc<dyn LifecycleOrchestrator>,
+        scheduler: WarmExecutionScheduler,
+    ) -> Self {
         Self {
             config,
             backend,
             lifecycle,
+            scheduler,
         }
     }
 }

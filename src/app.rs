@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 
 use crate::{
     lifecycle::{BackendStatus, LifecycleDecision, LifecycleRequest},
+    scheduler::WarmExecutionError,
     state::AppState,
 };
 
@@ -137,7 +138,7 @@ async fn chat_completions(
         );
     }
 
-    lifecycle_response(state.lifecycle.ensure_backend(LifecycleRequest::Chat).await)
+    inference_response(state, LifecycleRequest::Chat).await
 }
 
 async fn embeddings(
@@ -175,12 +176,38 @@ async fn embeddings(
         );
     }
 
-    lifecycle_response(
-        state
-            .lifecycle
-            .ensure_backend(LifecycleRequest::Embeddings)
-            .await,
-    )
+    inference_response(state, LifecycleRequest::Embeddings).await
+}
+
+async fn inference_response(state: AppState, request: LifecycleRequest) -> Response {
+    match state.lifecycle.ensure_backend(request.clone()).await {
+        LifecycleDecision::Ready(_) => match state
+            .scheduler
+            .execute(request, |cancellation| async move {
+                tokio::select! {
+                    _ = cancellation.cancelled() => openai_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "request_cancelled",
+                        "request was cancelled before upstream execution completed".to_string(),
+                        None,
+                    ),
+                    response = async {
+                        openai_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "backend_unavailable",
+                            "backend is ready but request forwarding is not implemented yet".to_string(),
+                            None,
+                        )
+                    } => response,
+                }
+            })
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => warm_execution_error_response(error),
+        },
+        decision => lifecycle_response(decision),
+    }
 }
 
 fn lifecycle_response(decision: LifecycleDecision) -> Response {
@@ -206,6 +233,15 @@ fn lifecycle_response(decision: LifecycleDecision) -> Response {
             None,
         ),
     }
+}
+
+fn warm_execution_error_response(error: WarmExecutionError) -> Response {
+    openai_error(
+        StatusCode::TOO_MANY_REQUESTS,
+        "overloaded",
+        error.message().to_string(),
+        None,
+    )
 }
 
 fn openai_error(
@@ -539,11 +575,12 @@ mod tests {
 
     use super::*;
     use crate::{
-        config::{AppConfig, EmbeddingsConfig, ModelConfig},
+        config::{AppConfig, EmbeddingsConfig, ModelConfig, WarmExecutionConfig},
         lifecycle::{
             BackendStatus, CapabilityState, LifecycleError, LifecycleOrchestrator, LifecycleState,
             Timestamp, TunnelState, UnitState,
         },
+        scheduler::WarmExecutionScheduler,
         state::AppState,
     };
 
@@ -579,6 +616,7 @@ mod tests {
                 owned_by: "test-suite".to_string(),
             },
             embeddings: EmbeddingsConfig { enabled: true },
+            warm_execution: WarmExecutionConfig::default(),
         }
     }
 
@@ -1055,6 +1093,7 @@ mod tests {
                 owned_by: "test-suite".to_string(),
             },
             embeddings: EmbeddingsConfig { enabled: false },
+            warm_execution: WarmExecutionConfig::default(),
         });
         let app = build_router(state);
 
@@ -1273,5 +1312,188 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["state"], "warming");
         assert_eq!(json["tunnel"]["state"], "connecting");
+    }
+
+    #[tokio::test]
+    async fn ready_embeddings_request_times_out_in_shared_warm_queue_with_429() {
+        let ready_status = BackendStatus {
+            lifecycle: LifecycleState::Ready,
+            tunnel: TunnelState::Ready,
+            ..BackendStatus::default()
+        };
+        let config = AppConfig {
+            warm_execution: WarmExecutionConfig {
+                max_active_requests: 1,
+                max_queued_requests: 1,
+                queue_timeout: std::time::Duration::from_millis(20),
+            },
+            ..test_config()
+        };
+        let scheduler = WarmExecutionScheduler::new(config.warm_execution.clone());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let held_slot = tokio::spawn({
+            let scheduler = scheduler.clone();
+            async move {
+                scheduler
+                    .execute(LifecycleRequest::Chat, |_| async move {
+                        let _ = release_rx.await;
+                    })
+                    .await
+                    .unwrap();
+            }
+        });
+        tokio::task::yield_now().await;
+
+        let app = build_router(AppState::with_services(
+            config,
+            Arc::new(RwLock::new(ready_status.clone())),
+            Arc::new(StaticLifecycleOrchestrator {
+                decision: LifecycleDecision::Ready(ready_status),
+            }),
+            scheduler,
+        ));
+
+        let response = app
+            .oneshot(
+                Request::post("/v1/embeddings")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model":"proxy-model","input":"hello"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["type"], "overloaded");
+        assert_eq!(
+            json["error"]["message"],
+            "request did not start before the warm queue timeout"
+        );
+
+        let _ = release_tx.send(());
+        held_slot.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ready_chat_request_times_out_in_shared_warm_queue_with_429() {
+        let ready_status = BackendStatus {
+            lifecycle: LifecycleState::Ready,
+            tunnel: TunnelState::Ready,
+            ..BackendStatus::default()
+        };
+        let config = AppConfig {
+            warm_execution: WarmExecutionConfig {
+                max_active_requests: 1,
+                max_queued_requests: 1,
+                queue_timeout: std::time::Duration::from_millis(20),
+            },
+            ..test_config()
+        };
+        let scheduler = WarmExecutionScheduler::new(config.warm_execution.clone());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let held_slot = tokio::spawn({
+            let scheduler = scheduler.clone();
+            async move {
+                scheduler
+                    .execute(LifecycleRequest::Embeddings, |_| async move {
+                        let _ = release_rx.await;
+                    })
+                    .await
+                    .unwrap();
+            }
+        });
+        tokio::task::yield_now().await;
+
+        let app = build_router(AppState::with_services(
+            config,
+            Arc::new(RwLock::new(ready_status.clone())),
+            Arc::new(StaticLifecycleOrchestrator {
+                decision: LifecycleDecision::Ready(ready_status),
+            }),
+            scheduler,
+        ));
+
+        let response = app
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"proxy-model","messages":[{"role":"user","content":"hi"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["type"], "overloaded");
+
+        let _ = release_tx.send(());
+        held_slot.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ready_chat_request_hits_immediate_shared_queue_full_with_429() {
+        let ready_status = BackendStatus {
+            lifecycle: LifecycleState::Ready,
+            tunnel: TunnelState::Ready,
+            ..BackendStatus::default()
+        };
+        let config = AppConfig {
+            warm_execution: WarmExecutionConfig {
+                max_active_requests: 1,
+                max_queued_requests: 0,
+                queue_timeout: std::time::Duration::from_millis(20),
+            },
+            ..test_config()
+        };
+        let scheduler = WarmExecutionScheduler::new(config.warm_execution.clone());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let held_slot = tokio::spawn({
+            let scheduler = scheduler.clone();
+            async move {
+                scheduler
+                    .execute(LifecycleRequest::Embeddings, |_| async move {
+                        let _ = release_rx.await;
+                    })
+                    .await
+                    .unwrap();
+            }
+        });
+        tokio::task::yield_now().await;
+
+        let app = build_router(AppState::with_services(
+            config,
+            Arc::new(RwLock::new(ready_status.clone())),
+            Arc::new(StaticLifecycleOrchestrator {
+                decision: LifecycleDecision::Ready(ready_status),
+            }),
+            scheduler,
+        ));
+
+        let response = app
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"proxy-model","messages":[{"role":"user","content":"hi"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["type"], "overloaded");
+        assert_eq!(json["error"]["message"], "warm execution queue is full");
+
+        let _ = release_tx.send(());
+        held_slot.await.unwrap();
     }
 }

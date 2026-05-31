@@ -1,4 +1,5 @@
 pub mod app;
 pub mod config;
 pub mod lifecycle;
+pub mod scheduler;
 pub mod state;
