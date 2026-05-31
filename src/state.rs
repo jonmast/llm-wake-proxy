@@ -80,7 +80,10 @@ impl BackendStatePublisher for SharedBackendState {
 struct NoopWakeRequester;
 
 impl WakeRequester for NoopWakeRequester {
-    fn request_wake(&self, _request: &LifecycleRequest) -> LifecycleFuture<'_, Result<(), LifecycleError>> {
+    fn request_wake(
+        &self,
+        _request: &LifecycleRequest,
+    ) -> LifecycleFuture<'_, Result<(), LifecycleError>> {
         Box::pin(async { Ok(()) })
     }
 }
@@ -102,13 +105,13 @@ impl HelperRpc for NoopHelperRpc {
     ) -> LifecycleFuture<'_, Result<ObservedBackendState, LifecycleError>> {
         Box::pin(async {
             Ok(ObservedBackendState {
-            lifecycle: LifecycleState::Warming,
-            chat: crate::lifecycle::CapabilityState::Ready,
-            embeddings: crate::lifecycle::CapabilityState::Ready,
-            embeddings_reason: None,
-            error: None,
-            llama_server_unit: crate::lifecycle::UnitState::Unknown,
-            inhibit_unit: crate::lifecycle::UnitState::Unknown,
+                lifecycle: LifecycleState::Warming,
+                chat: crate::lifecycle::CapabilityState::Ready,
+                embeddings: crate::lifecycle::CapabilityState::Ready,
+                embeddings_reason: None,
+                error: None,
+                llama_server_unit: crate::lifecycle::UnitState::Unknown,
+                inhibit_unit: crate::lifecycle::UnitState::Unknown,
             })
         })
     }

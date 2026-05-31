@@ -1,3 +1,4 @@
+use axum::extract::{FromRequest, FromRequestParts, rejection::JsonRejection};
 use axum::{
     Json, Router,
     extract::State,
@@ -6,7 +7,6 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use axum::extract::{FromRequest, FromRequestParts, rejection::JsonRejection};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -63,7 +63,10 @@ async fn healthz() -> impl IntoResponse {
 async fn status(State(state): State<AppState>) -> impl IntoResponse {
     let backend = state.lifecycle.status();
 
-    Json(StatusResponse::new(state.config.model.alias.clone(), backend))
+    Json(StatusResponse::new(
+        state.config.model.alias.clone(),
+        backend,
+    ))
 }
 
 async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
@@ -172,7 +175,12 @@ async fn embeddings(
         );
     }
 
-    lifecycle_response(state.lifecycle.ensure_backend(LifecycleRequest::Embeddings).await)
+    lifecycle_response(
+        state
+            .lifecycle
+            .ensure_backend(LifecycleRequest::Embeddings)
+            .await,
+    )
 }
 
 fn lifecycle_response(decision: LifecycleDecision) -> Response {
@@ -263,8 +271,7 @@ fn normalize_json_data_error(message: String) -> String {
     }
 
     if message.contains("missing field `content`") {
-        return "messages must include content unless assistant tool_calls are present"
-            .to_string();
+        return "messages must include content unless assistant tool_calls are present".to_string();
     }
 
     if message.contains("invalid type") {
@@ -534,8 +541,8 @@ mod tests {
     use crate::{
         config::{AppConfig, EmbeddingsConfig, ModelConfig},
         lifecycle::{
-            BackendStatus, CapabilityState, LifecycleError, LifecycleOrchestrator,
-            LifecycleState, Timestamp, TunnelState, UnitState,
+            BackendStatus, CapabilityState, LifecycleError, LifecycleOrchestrator, LifecycleState,
+            Timestamp, TunnelState, UnitState,
         },
         state::AppState,
     };
@@ -546,7 +553,10 @@ mod tests {
     }
 
     impl LifecycleOrchestrator for StaticLifecycleOrchestrator {
-        fn ensure_backend(&self, _request: LifecycleRequest) -> crate::lifecycle::LifecycleFuture<'_, LifecycleDecision> {
+        fn ensure_backend(
+            &self,
+            _request: LifecycleRequest,
+        ) -> crate::lifecycle::LifecycleFuture<'_, LifecycleDecision> {
             let decision = self.decision.clone();
             Box::pin(async move { decision })
         }
@@ -798,7 +808,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"]["message"], "tool messages must include tool_call_id");
+        assert_eq!(
+            json["error"]["message"],
+            "tool messages must include tool_call_id"
+        );
     }
 
     #[tokio::test]
@@ -819,7 +832,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"]["message"], "request body contains an invalid field type");
+        assert_eq!(
+            json["error"]["message"],
+            "request body contains an invalid field type"
+        );
     }
 
     #[tokio::test]
@@ -840,7 +856,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"]["message"], "request body contains invalid fields");
+        assert_eq!(
+            json["error"]["message"],
+            "request body contains invalid fields"
+        );
     }
 
     #[tokio::test]
@@ -861,7 +880,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"]["message"], "request body contains invalid fields");
+        assert_eq!(
+            json["error"]["message"],
+            "request body contains invalid fields"
+        );
     }
 
     #[tokio::test]
@@ -882,7 +904,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"]["message"], "request body contains invalid fields");
+        assert_eq!(
+            json["error"]["message"],
+            "request body contains invalid fields"
+        );
     }
 
     #[tokio::test]
@@ -903,7 +928,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"]["message"], "assistant messages tool_calls must not be empty");
+        assert_eq!(
+            json["error"]["message"],
+            "assistant messages tool_calls must not be empty"
+        );
     }
 
     #[tokio::test]
@@ -924,7 +952,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"]["message"], "only assistant messages may include tool_calls");
+        assert_eq!(
+            json["error"]["message"],
+            "only assistant messages may include tool_calls"
+        );
     }
 
     #[tokio::test]
@@ -945,7 +976,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"]["message"], "only tool messages may include tool_call_id");
+        assert_eq!(
+            json["error"]["message"],
+            "only tool messages may include tool_call_id"
+        );
     }
 
     #[tokio::test]
@@ -965,7 +999,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"]["message"], "content-type must be application/json");
+        assert_eq!(
+            json["error"]["message"],
+            "content-type must be application/json"
+        );
     }
 
     #[tokio::test]
@@ -1028,7 +1065,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"]["message"], "unsupported field 'encoding_format'");
+        assert_eq!(
+            json["error"]["message"],
+            "unsupported field 'encoding_format'"
+        );
     }
 
     #[tokio::test]

@@ -122,7 +122,10 @@ pub enum LifecycleDecision {
 }
 
 pub trait WakeRequester: Send + Sync {
-    fn request_wake(&self, request: &LifecycleRequest) -> LifecycleFuture<'_, Result<(), LifecycleError>>;
+    fn request_wake(
+        &self,
+        request: &LifecycleRequest,
+    ) -> LifecycleFuture<'_, Result<(), LifecycleError>>;
 }
 
 pub trait SshReadinessProbe: Send + Sync {
@@ -330,7 +333,10 @@ mod tests {
     }
 
     impl WakeRequester for FakeWakeRequester {
-        fn request_wake(&self, request: &LifecycleRequest) -> LifecycleFuture<'_, Result<(), LifecycleError>> {
+        fn request_wake(
+            &self,
+            request: &LifecycleRequest,
+        ) -> LifecycleFuture<'_, Result<(), LifecycleError>> {
             self.calls.lock().unwrap().push(request.clone());
             let error = self.error.clone();
             Box::pin(async move {
@@ -405,13 +411,29 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
     struct FakeTunnelOwner {
         tunnel_state: TunnelState,
+        calls: Arc<Mutex<usize>>,
+    }
+
+    impl FakeTunnelOwner {
+        fn new(tunnel_state: TunnelState) -> Self {
+            Self {
+                tunnel_state,
+                calls: Arc::new(Mutex::new(0)),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            *self.calls.lock().unwrap()
+        }
     }
 
     impl TunnelOwner for FakeTunnelOwner {
         fn ensure_tunnel(&self) -> LifecycleFuture<'_, Result<TunnelState, LifecycleError>> {
             let tunnel_state = self.tunnel_state;
+            *self.calls.lock().unwrap() += 1;
             Box::pin(async move { Ok(tunnel_state) })
         }
     }
@@ -462,9 +484,7 @@ mod tests {
             wake,
             FakeSshReadinessProbe { ready: false },
             helper,
-            FakeTunnelOwner {
-                tunnel_state: TunnelState::Down,
-            },
+            FakeTunnelOwner::new(TunnelState::Down),
             FakeClock {
                 now: Timestamp::new(FAKE_NOW),
             },
@@ -497,9 +517,7 @@ mod tests {
             FakeWakeRequester::default(),
             FakeSshReadinessProbe { ready: true },
             FakeHelperRpc::ready(),
-            FakeTunnelOwner {
-                tunnel_state: TunnelState::Ready,
-            },
+            FakeTunnelOwner::new(TunnelState::Ready),
             FakeClock {
                 now: Timestamp::new(FAKE_NOW),
             },
@@ -530,9 +548,7 @@ mod tests {
             FakeWakeRequester::with_error("wake failed"),
             FakeSshReadinessProbe { ready: false },
             FakeHelperRpc::default(),
-            FakeTunnelOwner {
-                tunnel_state: TunnelState::Down,
-            },
+            FakeTunnelOwner::new(TunnelState::Down),
             FakeClock {
                 now: Timestamp::new(FAKE_NOW),
             },
@@ -562,9 +578,7 @@ mod tests {
             wake.clone(),
             FakeSshReadinessProbe { ready: false },
             FakeHelperRpc::default(),
-            FakeTunnelOwner {
-                tunnel_state: TunnelState::Down,
-            },
+            FakeTunnelOwner::new(TunnelState::Down),
             FakeClock {
                 now: Timestamp::new(FAKE_NOW),
             },
@@ -589,9 +603,7 @@ mod tests {
             FakeWakeRequester::default(),
             FakeSshReadinessProbe { ready: true },
             FakeHelperRpc::error("helper reported backend failure"),
-            FakeTunnelOwner {
-                tunnel_state: TunnelState::Ready,
-            },
+            FakeTunnelOwner::new(TunnelState::Ready),
             FakeClock {
                 now: Timestamp::new(FAKE_NOW),
             },
@@ -626,9 +638,7 @@ mod tests {
             wake.clone(),
             FakeSshReadinessProbe { ready: false },
             FakeHelperRpc::default(),
-            FakeTunnelOwner {
-                tunnel_state: TunnelState::Ready,
-            },
+            FakeTunnelOwner::new(TunnelState::Ready),
             FakeClock {
                 now: Timestamp::new(FAKE_NOW),
             },
@@ -664,9 +674,7 @@ mod tests {
             wake.clone(),
             FakeSshReadinessProbe { ready: false },
             FakeHelperRpc::default(),
-            FakeTunnelOwner {
-                tunnel_state: TunnelState::Down,
-            },
+            FakeTunnelOwner::new(TunnelState::Down),
             FakeClock {
                 now: Timestamp::new(FAKE_NOW),
             },
@@ -685,5 +693,75 @@ mod tests {
 
         assert_eq!(state.latest().lifecycle, LifecycleState::Warming);
         assert_eq!(wake.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn warm_backend_reuses_existing_readiness_without_requesting_wake() {
+        let wake = FakeWakeRequester::default();
+        let helper = FakeHelperRpc::ready();
+        let tunnel = FakeTunnelOwner::new(TunnelState::Ready);
+        let state = FakeBackendStatePublisher::new(BackendStatus {
+            lifecycle: LifecycleState::Ready,
+            tunnel: TunnelState::Ready,
+            ..BackendStatus::default()
+        });
+        let lifecycle = LifecycleManager::new(
+            wake.clone(),
+            FakeSshReadinessProbe { ready: true },
+            helper,
+            tunnel.clone(),
+            FakeClock {
+                now: Timestamp::new(FAKE_NOW),
+            },
+            state.clone(),
+        );
+
+        let decision = lifecycle.ensure_backend(LifecycleRequest::Chat).await;
+
+        match decision {
+            LifecycleDecision::Ready(status) => {
+                assert_eq!(status.lifecycle, LifecycleState::Ready);
+                assert_eq!(status.tunnel, TunnelState::Ready);
+            }
+            other => panic!("expected ready decision, got {other:?}"),
+        }
+
+        assert_eq!(wake.call_count(), 0);
+        assert_eq!(tunnel.call_count(), 1);
+        assert_eq!(state.latest().lifecycle, LifecycleState::Ready);
+    }
+
+    #[tokio::test]
+    async fn restart_rediscovery_adopts_ready_backend_and_creates_fresh_tunnel() {
+        let wake = FakeWakeRequester::default();
+        let helper = FakeHelperRpc::ready();
+        let tunnel = FakeTunnelOwner::new(TunnelState::Ready);
+        let state = FakeBackendStatePublisher::new(BackendStatus::default());
+        let lifecycle = LifecycleManager::new(
+            wake.clone(),
+            FakeSshReadinessProbe { ready: true },
+            helper,
+            tunnel.clone(),
+            FakeClock {
+                now: Timestamp::new(FAKE_NOW),
+            },
+            state.clone(),
+        );
+
+        let decision = lifecycle.ensure_backend(LifecycleRequest::Chat).await;
+
+        match decision {
+            LifecycleDecision::Ready(status) => {
+                assert_eq!(status.lifecycle, LifecycleState::Ready);
+                assert_eq!(status.tunnel, TunnelState::Ready);
+                assert_eq!(status.llama_server_unit, UnitState::Active);
+                assert_eq!(status.inhibit_unit, UnitState::Active);
+            }
+            other => panic!("expected ready decision, got {other:?}"),
+        }
+
+        assert_eq!(wake.call_count(), 0);
+        assert_eq!(tunnel.call_count(), 1);
+        assert_eq!(state.latest().lifecycle, LifecycleState::Ready);
     }
 }
