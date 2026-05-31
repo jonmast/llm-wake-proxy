@@ -7,10 +7,13 @@ use axum::{
     routing::{get, post},
 };
 use axum::extract::{FromRequest, FromRequestParts, rejection::JsonRejection};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::state::{AppState, LifecycleState};
+use crate::{
+    lifecycle::{BackendStatus, LifecycleDecision, LifecycleRequest},
+    state::AppState,
+};
 
 pub fn build_router(state: AppState) -> Router {
     Router::new()
@@ -58,26 +61,9 @@ async fn healthz() -> impl IntoResponse {
 }
 
 async fn status(State(state): State<AppState>) -> impl IntoResponse {
-    let backend = state.backend.read().await;
+    let backend = state.lifecycle.status();
 
-    Json(json!({
-        "state": backend.lifecycle.as_str(),
-        "model_alias": state.config.model.alias,
-        "capabilities": {
-            "chat": backend.chat.as_str(),
-            "embeddings": backend.embeddings.as_str(),
-            "embeddings_reason": backend.embeddings_reason,
-        },
-        "last_wake_attempt_at": backend.last_wake_attempt_at,
-        "lease_expires_at": backend.lease_expires_at,
-        "tunnel": {
-            "state": backend.tunnel.as_str(),
-        },
-        "units": {
-            "llama_server": backend.llama_server_unit.as_str(),
-            "inhibit_holder": backend.inhibit_unit.as_str(),
-        }
-    }))
+    Json(StatusResponse::new(state.config.model.alias.clone(), backend))
 }
 
 async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
@@ -148,17 +134,7 @@ async fn chat_completions(
         );
     }
 
-    let mut backend = state.backend.write().await;
-    if matches!(backend.lifecycle, LifecycleState::Cold) {
-        backend.lifecycle = LifecycleState::Warming;
-    }
-
-    openai_error(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "warming_up",
-        "backend wake and forwarding are not implemented yet".to_string(),
-        Some("10"),
-    )
+    lifecycle_response(state.lifecycle.ensure_backend(LifecycleRequest::Chat).await)
 }
 
 async fn embeddings(
@@ -196,17 +172,32 @@ async fn embeddings(
         );
     }
 
-    let mut backend = state.backend.write().await;
-    if matches!(backend.lifecycle, LifecycleState::Cold) {
-        backend.lifecycle = LifecycleState::Warming;
-    }
+    lifecycle_response(state.lifecycle.ensure_backend(LifecycleRequest::Embeddings).await)
+}
 
-    openai_error(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "warming_up",
-        "backend wake and forwarding are not implemented yet".to_string(),
-        Some("10"),
-    )
+fn lifecycle_response(decision: LifecycleDecision) -> Response {
+    match decision {
+        LifecycleDecision::Ready(_) => openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "backend_unavailable",
+            "backend is ready but request forwarding is not implemented yet".to_string(),
+            None,
+        ),
+        LifecycleDecision::Warming {
+            retry_after_secs, ..
+        } => openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "warming_up",
+            "backend wake and forwarding are not implemented yet".to_string(),
+            Some(&retry_after_secs.to_string()),
+        ),
+        LifecycleDecision::Failed { error, .. } => openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "backend_error",
+            error.message,
+            None,
+        ),
+    }
 }
 
 fn openai_error(
@@ -476,8 +467,62 @@ struct EmbeddingsRequest {
     input: Value,
 }
 
+#[derive(Serialize)]
+struct StatusResponse {
+    state: crate::lifecycle::LifecycleState,
+    model_alias: String,
+    capabilities: CapabilityStatusResponse,
+    last_wake_attempt_at: Option<crate::lifecycle::Timestamp>,
+    lease_expires_at: Option<crate::lifecycle::Timestamp>,
+    tunnel: TunnelStatusResponse,
+    units: UnitStatusResponse,
+}
+
+impl StatusResponse {
+    fn new(model_alias: String, backend: BackendStatus) -> Self {
+        Self {
+            state: backend.lifecycle,
+            model_alias,
+            capabilities: CapabilityStatusResponse {
+                chat: backend.chat,
+                embeddings: backend.embeddings,
+                embeddings_reason: backend.embeddings_reason,
+            },
+            last_wake_attempt_at: backend.last_wake_attempt_at,
+            lease_expires_at: backend.lease_expires_at,
+            tunnel: TunnelStatusResponse {
+                state: backend.tunnel,
+            },
+            units: UnitStatusResponse {
+                llama_server: backend.llama_server_unit,
+                inhibit_holder: backend.inhibit_unit,
+            },
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct CapabilityStatusResponse {
+    chat: crate::lifecycle::CapabilityState,
+    embeddings: crate::lifecycle::CapabilityState,
+    embeddings_reason: Option<String>,
+}
+
+#[derive(Serialize)]
+struct TunnelStatusResponse {
+    state: crate::lifecycle::TunnelState,
+}
+
+#[derive(Serialize)]
+struct UnitStatusResponse {
+    llama_server: crate::lifecycle::UnitState,
+    inhibit_holder: crate::lifecycle::UnitState,
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, RwLock};
+
     use axum::{
         body::Body,
         http::{Request, StatusCode},
@@ -488,11 +533,35 @@ mod tests {
     use super::*;
     use crate::{
         config::{AppConfig, EmbeddingsConfig, ModelConfig},
+        lifecycle::{
+            BackendStatus, CapabilityState, LifecycleError, LifecycleOrchestrator,
+            LifecycleState, Timestamp, TunnelState, UnitState,
+        },
         state::AppState,
     };
 
-    fn test_state() -> AppState {
-        AppState::new(AppConfig {
+    #[derive(Clone)]
+    struct StaticLifecycleOrchestrator {
+        decision: LifecycleDecision,
+    }
+
+    impl LifecycleOrchestrator for StaticLifecycleOrchestrator {
+        fn ensure_backend(&self, _request: LifecycleRequest) -> crate::lifecycle::LifecycleFuture<'_, LifecycleDecision> {
+            let decision = self.decision.clone();
+            Box::pin(async move { decision })
+        }
+
+        fn status(&self) -> BackendStatus {
+            match &self.decision {
+                LifecycleDecision::Ready(status) => status.clone(),
+                LifecycleDecision::Warming { status, .. } => status.clone(),
+                LifecycleDecision::Failed { status, .. } => status.clone(),
+            }
+        }
+    }
+
+    fn test_config() -> AppConfig {
+        AppConfig {
             listen_port: 3000,
             model: ModelConfig {
                 alias: "proxy-model".to_string(),
@@ -500,7 +569,19 @@ mod tests {
                 owned_by: "test-suite".to_string(),
             },
             embeddings: EmbeddingsConfig { enabled: true },
-        })
+        }
+    }
+
+    fn test_state() -> AppState {
+        AppState::new(test_config())
+    }
+
+    fn state_with_lifecycle(decision: LifecycleDecision, backend: BackendStatus) -> AppState {
+        AppState::with_lifecycle(
+            test_config(),
+            Arc::new(RwLock::new(backend)),
+            Arc::new(StaticLifecycleOrchestrator { decision }),
+        )
     }
 
     #[tokio::test]
@@ -527,7 +608,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let backend = state.backend.read().await;
+        let backend = state.backend.read().unwrap();
         assert!(matches!(backend.lifecycle, LifecycleState::Cold));
     }
 
@@ -569,7 +650,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()["retry-after"], "10");
 
-        let backend = state.backend.read().await;
+        let backend = state.backend.read().unwrap();
         assert!(matches!(backend.lifecycle, LifecycleState::Warming));
     }
 
@@ -652,7 +733,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()["retry-after"], "10");
 
-        let backend = state.backend.read().await;
+        let backend = state.backend.read().unwrap();
         assert!(matches!(backend.lifecycle, LifecycleState::Warming));
     }
 
@@ -695,7 +776,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()["retry-after"], "10");
 
-        let backend = state.backend.read().await;
+        let backend = state.backend.read().unwrap();
         assert!(matches!(backend.lifecycle, LifecycleState::Warming));
     }
 
@@ -969,8 +1050,71 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()["retry-after"], "10");
 
-        let backend = state.backend.read().await;
+        let backend = state.backend.read().unwrap();
         assert!(matches!(backend.lifecycle, LifecycleState::Warming));
+    }
+
+    #[tokio::test]
+    async fn chat_ready_decision_maps_to_backend_unavailable_without_retry_after() {
+        let ready_status = BackendStatus {
+            lifecycle: LifecycleState::Ready,
+            tunnel: TunnelState::Ready,
+            ..BackendStatus::default()
+        };
+        let app = build_router(state_with_lifecycle(
+            LifecycleDecision::Ready(ready_status.clone()),
+            ready_status,
+        ));
+
+        let response = app
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"proxy-model","messages":[{"role":"user","content":"hi"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().get("retry-after").is_none());
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["type"], "backend_unavailable");
+    }
+
+    #[tokio::test]
+    async fn embeddings_failed_decision_maps_to_backend_error() {
+        let failed_status = BackendStatus {
+            lifecycle: LifecycleState::Error,
+            ..BackendStatus::default()
+        };
+        let app = build_router(state_with_lifecycle(
+            LifecycleDecision::Failed {
+                status: failed_status.clone(),
+                error: LifecycleError::new("helper command failed"),
+            },
+            failed_status,
+        ));
+
+        let response = app
+            .oneshot(
+                Request::post("/v1/embeddings")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model":"proxy-model","input":"hello"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().get("retry-after").is_none());
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["type"], "backend_error");
+        assert_eq!(json["error"]["message"], "helper command failed");
     }
 
     #[tokio::test]
@@ -989,5 +1133,74 @@ mod tests {
         assert_eq!(json["model_alias"], "proxy-model");
         assert_eq!(json["capabilities"]["chat"], "ready");
         assert_eq!(json["capabilities"]["embeddings"], "ready");
+    }
+
+    #[tokio::test]
+    async fn status_serializes_timestamps_tunnel_and_units() {
+        let backend = BackendStatus {
+            lifecycle: LifecycleState::Ready,
+            chat: CapabilityState::Degraded,
+            embeddings: CapabilityState::Ready,
+            embeddings_reason: Some("remote disabled".to_string()),
+            tunnel: TunnelState::Ready,
+            last_wake_attempt_at: Some(Timestamp::new(1_717_156_800)),
+            lease_expires_at: Some(Timestamp::new(1_717_158_600)),
+            llama_server_unit: UnitState::Active,
+            inhibit_unit: UnitState::Activating,
+        };
+        let app = build_router(state_with_lifecycle(
+            LifecycleDecision::Warming {
+                status: backend.clone(),
+                retry_after_secs: 10,
+            },
+            backend,
+        ));
+
+        let response = app
+            .oneshot(Request::get("/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["state"], "ready");
+        assert_eq!(json["capabilities"]["chat"], "degraded");
+        assert_eq!(json["capabilities"]["embeddings_reason"], "remote disabled");
+        assert_eq!(json["tunnel"]["state"], "ready");
+        assert_eq!(json["units"]["llama_server"], "active");
+        assert_eq!(json["units"]["inhibit_holder"], "activating");
+        assert_eq!(json["last_wake_attempt_at"], 1717156800u64);
+        assert_eq!(json["lease_expires_at"], 1717158600u64);
+    }
+
+    #[tokio::test]
+    async fn status_reads_from_orchestrator_snapshot_not_backend_lock() {
+        let app = build_router(state_with_lifecycle(
+            LifecycleDecision::Warming {
+                status: BackendStatus {
+                    lifecycle: LifecycleState::Warming,
+                    tunnel: TunnelState::Connecting,
+                    ..BackendStatus::default()
+                },
+                retry_after_secs: 10,
+            },
+            BackendStatus {
+                lifecycle: LifecycleState::Cold,
+                ..BackendStatus::default()
+            },
+        ));
+
+        let response = app
+            .oneshot(Request::get("/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["state"], "warming");
+        assert_eq!(json["tunnel"]["state"], "connecting");
     }
 }
