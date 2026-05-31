@@ -641,30 +641,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_marks_backend_warming_and_returns_retryable_503() {
-        let state = test_state();
-        let app = build_router(state.clone());
-
-        let response = app
-            .oneshot(
-                Request::post("/v1/chat/completions")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"model":"proxy-model","messages":[{"role":"user","content":"hi"}]}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(response.headers()["retry-after"], "10");
-
-        let backend = state.backend.read().unwrap();
-        assert!(matches!(backend.lifecycle, LifecycleState::Warming));
-    }
-
-    #[tokio::test]
     async fn chat_rejects_empty_messages() {
         let app = build_router(test_state());
         let response = app
@@ -724,16 +700,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_accepts_tool_calling_fields_and_null_assistant_content() {
-        let state = test_state();
-        let app = build_router(state.clone());
+    async fn chat_warming_decision_maps_to_retryable_503() {
+        let warming_status = BackendStatus {
+            lifecycle: LifecycleState::Warming,
+            tunnel: TunnelState::Down,
+            ..BackendStatus::default()
+        };
+        let app = build_router(state_with_lifecycle(
+            LifecycleDecision::Warming {
+                status: warming_status.clone(),
+                retry_after_secs: 10,
+            },
+            warming_status,
+        ));
 
         let response = app
             .oneshot(
                 Request::post("/v1/chat/completions")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"model":"proxy-model","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_1","content":"{}"}],"tools":[{"type":"function","function":{"name":"lookup","description":"Lookup data","parameters":{"type":"object"}}}],"tool_choice":"auto"}"#,
+                        r#"{"model":"proxy-model","messages":[{"role":"user","content":"hi"}]}"#,
                     ))
                     .unwrap(),
             )
@@ -742,9 +728,9 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()["retry-after"], "10");
-
-        let backend = state.backend.read().unwrap();
-        assert!(matches!(backend.lifecycle, LifecycleState::Warming));
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["type"], "warming_up");
     }
 
     #[tokio::test]
@@ -766,9 +752,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_accepts_tool_calling_fields_and_null_assistant_content() {
+        let warming_status = BackendStatus {
+            lifecycle: LifecycleState::Warming,
+            tunnel: TunnelState::Down,
+            ..BackendStatus::default()
+        };
+        let app = build_router(state_with_lifecycle(
+            LifecycleDecision::Warming {
+                status: warming_status.clone(),
+                retry_after_secs: 10,
+            },
+            warming_status,
+        ));
+
+        let response = app
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"proxy-model","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_1","content":"{}"}],"tools":[{"type":"function","function":{"name":"lookup","description":"Lookup data","parameters":{"type":"object"}}}],"tool_choice":"auto"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()["retry-after"], "10");
+    }
+
+    #[tokio::test]
     async fn chat_accepts_authorization_header_identically() {
-        let state = test_state();
-        let app = build_router(state.clone());
+        let warming_status = BackendStatus {
+            lifecycle: LifecycleState::Warming,
+            tunnel: TunnelState::Down,
+            ..BackendStatus::default()
+        };
+        let app = build_router(state_with_lifecycle(
+            LifecycleDecision::Warming {
+                status: warming_status.clone(),
+                retry_after_secs: 10,
+            },
+            warming_status,
+        ));
 
         let response = app
             .oneshot(
@@ -785,9 +812,6 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()["retry-after"], "10");
-
-        let backend = state.backend.read().unwrap();
-        assert!(matches!(backend.lifecycle, LifecycleState::Warming));
     }
 
     #[tokio::test]
@@ -1073,8 +1097,18 @@ mod tests {
 
     #[tokio::test]
     async fn embeddings_accepts_authorization_header_identically() {
-        let state = test_state();
-        let app = build_router(state.clone());
+        let warming_status = BackendStatus {
+            lifecycle: LifecycleState::Warming,
+            tunnel: TunnelState::Down,
+            ..BackendStatus::default()
+        };
+        let app = build_router(state_with_lifecycle(
+            LifecycleDecision::Warming {
+                status: warming_status.clone(),
+                retry_after_secs: 10,
+            },
+            warming_status,
+        ));
 
         let response = app
             .oneshot(
@@ -1089,9 +1123,6 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()["retry-after"], "10");
-
-        let backend = state.backend.read().unwrap();
-        assert!(matches!(backend.lifecycle, LifecycleState::Warming));
     }
 
     #[tokio::test]

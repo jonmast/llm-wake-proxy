@@ -1,7 +1,10 @@
-use std::{future::Future, pin::Pin};
+use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use serde::Serialize;
-use tokio::sync::Mutex;
+use tokio::{
+    sync::{Mutex, watch},
+    time::Instant,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
@@ -10,6 +13,10 @@ pub struct Timestamp(u64);
 impl Timestamp {
     pub fn new(unix_seconds: u64) -> Self {
         Self(unix_seconds)
+    }
+
+    pub fn unix_seconds(self) -> u64 {
+        self.0
     }
 }
 
@@ -157,144 +164,414 @@ pub trait LifecycleOrchestrator: Send + Sync {
     fn status(&self) -> BackendStatus;
 }
 
-pub struct LifecycleManager<W, S, H, T, C, P> {
+#[derive(Clone, Copy, Debug)]
+pub struct LifecycleTiming {
+    pub cold_wait_budget_secs: u64,
+    pub hard_boot_deadline_secs: u64,
+    pub bootstrap_poll_interval_millis: u64,
+    pub retry_after_secs: u64,
+}
+
+impl Default for LifecycleTiming {
+    fn default() -> Self {
+        Self {
+            cold_wait_budget_secs: 90,
+            hard_boot_deadline_secs: 5 * 60,
+            bootstrap_poll_interval_millis: 1_000,
+            retry_after_secs: 10,
+        }
+    }
+}
+
+struct BootstrapState {
+    active: bool,
+    last_error: Option<LifecycleError>,
+    observe_request: LifecycleRequest,
+}
+
+impl Default for BootstrapState {
+    fn default() -> Self {
+        Self {
+            active: false,
+            last_error: None,
+            observe_request: LifecycleRequest::Chat,
+        }
+    }
+}
+
+struct LifecycleCore<W, S, H, T, C, P> {
     wake: W,
     ssh: S,
     helper: H,
     tunnel: T,
     clock: C,
     state: P,
-    retry_after_secs: u64,
-    orchestration_lock: Mutex<()>,
+    timing: LifecycleTiming,
+    bootstrap: Mutex<BootstrapState>,
+    status_tx: watch::Sender<BackendStatus>,
+}
+
+pub struct LifecycleManager<W, S, H, T, C, P> {
+    core: Arc<LifecycleCore<W, S, H, T, C, P>>,
 }
 
 impl<W, S, H, T, C, P> LifecycleManager<W, S, H, T, C, P> {
-    pub fn new(wake: W, ssh: S, helper: H, tunnel: T, clock: C, state: P) -> Self {
-        Self {
+    pub fn new(wake: W, ssh: S, helper: H, tunnel: T, clock: C, state: P) -> Self
+    where
+        P: BackendStatePublisher,
+    {
+        Self::new_with_timing(
             wake,
             ssh,
             helper,
             tunnel,
             clock,
             state,
-            retry_after_secs: 10,
-            orchestration_lock: Mutex::new(()),
+            LifecycleTiming::default(),
+        )
+    }
+
+    pub fn new_with_timing(
+        wake: W,
+        ssh: S,
+        helper: H,
+        tunnel: T,
+        clock: C,
+        state: P,
+        timing: LifecycleTiming,
+    ) -> Self
+    where
+        P: BackendStatePublisher,
+    {
+        let initial_status = state.snapshot();
+        let (status_tx, _) = watch::channel(initial_status);
+
+        Self {
+            core: Arc::new(LifecycleCore {
+                wake,
+                ssh,
+                helper,
+                tunnel,
+                clock,
+                state,
+                timing,
+                bootstrap: Mutex::new(BootstrapState::default()),
+                status_tx,
+            }),
+        }
+    }
+}
+
+impl<W, S, H, T, C, P> LifecycleCore<W, S, H, T, C, P>
+where
+    W: WakeRequester + Send + Sync + 'static,
+    S: SshReadinessProbe + Send + Sync + 'static,
+    H: HelperRpc + Send + Sync + 'static,
+    T: TunnelOwner + Send + Sync + 'static,
+    C: Clock + Send + Sync + 'static,
+    P: BackendStatePublisher + Send + Sync + 'static,
+{
+    fn publish(&self, status: BackendStatus) {
+        self.state.publish(status.clone());
+        let _ = self.status_tx.send(status);
+    }
+
+    async fn start_or_join_bootstrap(
+        &self,
+        initial_status: BackendStatus,
+        request: &LifecycleRequest,
+    ) -> (bool, watch::Receiver<BackendStatus>, BackendStatus) {
+        let mut bootstrap = self.bootstrap.lock().await;
+        let should_start = !bootstrap.active;
+
+        if should_start {
+            bootstrap.active = true;
+            bootstrap.last_error = None;
+            bootstrap.observe_request = request.clone();
+        } else if request_priority(request) > request_priority(&bootstrap.observe_request) {
+            bootstrap.observe_request = request.clone();
+        }
+
+        (should_start, self.status_tx.subscribe(), initial_status)
+    }
+
+    async fn bootstrap_observe_request(&self) -> LifecycleRequest {
+        self.bootstrap.lock().await.observe_request.clone()
+    }
+
+    async fn observe_once(
+        &self,
+        wake_request: Option<&LifecycleRequest>,
+        observe_request: LifecycleRequest,
+        mut status: BackendStatus,
+    ) -> LifecycleDecision {
+        let ssh_ready = match self.ssh.is_ready().await {
+            Ok(ready) => ready,
+            Err(error) => {
+                status.lifecycle = LifecycleState::Error;
+                status.tunnel = TunnelState::Down;
+                return LifecycleDecision::Failed { status, error };
+            }
+        };
+
+        if !ssh_ready {
+            if let Some(wake_request) = wake_request.filter(|_| should_request_wake(status.lifecycle)) {
+                status.last_wake_attempt_at = Some(self.clock.now());
+                status.tunnel = TunnelState::Down;
+
+                if let Err(error) = self.wake.request_wake(wake_request).await {
+                    status.lifecycle = LifecycleState::Error;
+                    return LifecycleDecision::Failed { status, error };
+                }
+            }
+
+            status.lifecycle = LifecycleState::Warming;
+            status.tunnel = TunnelState::Down;
+            self.publish(status.clone());
+            return LifecycleDecision::Warming {
+                status,
+                retry_after_secs: self.timing.retry_after_secs,
+            };
+        }
+
+        let observed = match self.helper.observe_backend(&observe_request).await {
+            Ok(observed) => observed,
+            Err(error) => {
+                status.lifecycle = LifecycleState::Error;
+                status.tunnel = TunnelState::Down;
+                return LifecycleDecision::Failed { status, error };
+            }
+        };
+
+        status.lifecycle = observed.lifecycle;
+        status.chat = observed.chat;
+        status.embeddings = observed.embeddings;
+        status.embeddings_reason = observed.embeddings_reason;
+        status.llama_server_unit = observed.llama_server_unit;
+        status.inhibit_unit = observed.inhibit_unit;
+
+        if matches!(status.lifecycle, LifecycleState::Error) {
+            status.tunnel = TunnelState::Down;
+            let error = LifecycleError::new(
+                observed
+                    .error
+                    .unwrap_or_else(|| "backend reported error state".to_string()),
+            );
+            return LifecycleDecision::Failed { status, error };
+        }
+
+        if !matches!(status.lifecycle, LifecycleState::Ready) {
+            status.tunnel = TunnelState::Down;
+            self.publish(status.clone());
+            return LifecycleDecision::Warming {
+                status,
+                retry_after_secs: self.timing.retry_after_secs,
+            };
+        }
+
+        status.tunnel = match self.tunnel.ensure_tunnel().await {
+            Ok(tunnel_state) => tunnel_state,
+            Err(error) => {
+                status.lifecycle = LifecycleState::Error;
+                status.tunnel = TunnelState::Down;
+                return LifecycleDecision::Failed { status, error };
+            }
+        };
+
+        if !matches!(status.tunnel, TunnelState::Ready) {
+            status.lifecycle = LifecycleState::Warming;
+        }
+
+        self.publish(status.clone());
+
+        if matches!(status.lifecycle, LifecycleState::Ready)
+            && matches!(status.tunnel, TunnelState::Ready)
+        {
+            LifecycleDecision::Ready(status)
+        } else {
+            LifecycleDecision::Warming {
+                status,
+                retry_after_secs: self.timing.retry_after_secs,
+            }
+        }
+    }
+
+    fn bootstrap_deadline(&self) -> Instant {
+        let now = self.clock.now().unix_seconds();
+        let wake_started_at = self
+            .state
+            .snapshot()
+            .last_wake_attempt_at
+            .map(Timestamp::unix_seconds)
+            .unwrap_or(now);
+        let hard_deadline_at = wake_started_at.saturating_add(self.timing.hard_boot_deadline_secs);
+
+        Instant::now() + Duration::from_secs(hard_deadline_at.saturating_sub(now))
+    }
+
+    async fn start_bootstrap(self: Arc<Self>) {
+        let deadline = self.bootstrap_deadline();
+        let poll_interval = Duration::from_millis(self.timing.bootstrap_poll_interval_millis);
+
+        loop {
+            if Instant::now() >= deadline {
+                let error =
+                    LifecycleError::new("backend did not become ready before the boot deadline");
+                let mut status = self.state.snapshot();
+                status.lifecycle = LifecycleState::Error;
+                status.tunnel = TunnelState::Down;
+                self.finish_bootstrap(status, Some(error)).await;
+                return;
+            }
+
+            if !poll_interval.is_zero() {
+                tokio::time::sleep(poll_interval).await;
+            }
+
+            if Instant::now() >= deadline {
+                let error =
+                    LifecycleError::new("backend did not become ready before the boot deadline");
+                let mut status = self.state.snapshot();
+                status.lifecycle = LifecycleState::Error;
+                status.tunnel = TunnelState::Down;
+                self.finish_bootstrap(status, Some(error)).await;
+                return;
+            }
+
+            let status = self.state.snapshot();
+
+            let observe_request = self.bootstrap_observe_request().await;
+
+            match self.observe_once(None, observe_request, status).await {
+                LifecycleDecision::Ready(status) => {
+                    self.finish_bootstrap(status, None).await;
+                    return;
+                }
+                LifecycleDecision::Failed { status, error } => {
+                    self.finish_bootstrap(status, Some(error)).await;
+                    return;
+                }
+                LifecycleDecision::Warming { .. } => {}
+            }
+        }
+    }
+
+    async fn finish_bootstrap(&self, status: BackendStatus, error: Option<LifecycleError>) {
+        let mut bootstrap = self.bootstrap.lock().await;
+        bootstrap.last_error = error.clone();
+        self.publish(status);
+        bootstrap.active = false;
+    }
+
+    async fn wait_for_ready_or_timeout(
+        &self,
+        mut status_rx: watch::Receiver<BackendStatus>,
+    ) -> LifecycleDecision {
+        let wait_deadline = Instant::now() + Duration::from_secs(self.timing.cold_wait_budget_secs);
+
+        loop {
+            let status = status_rx.borrow().clone();
+            let (bootstrap_active, last_error) = {
+                let bootstrap = self.bootstrap.lock().await;
+                (bootstrap.active, bootstrap.last_error.clone())
+            };
+            let stale_bootstrap_view = bootstrap_active && !matches!(status.lifecycle, LifecycleState::Warming);
+
+            if !stale_bootstrap_view && backend_is_ready(&status) {
+                return LifecycleDecision::Ready(status);
+            }
+
+            if !stale_bootstrap_view && matches!(status.lifecycle, LifecycleState::Error) {
+                let error = last_error.unwrap_or_else(|| LifecycleError::new("backend reported error state"));
+                return LifecycleDecision::Failed { status, error };
+            }
+
+            let now = Instant::now();
+            if now >= wait_deadline {
+                return LifecycleDecision::Warming {
+                    status: bootstrap_wait_status(status, stale_bootstrap_view),
+                    retry_after_secs: self.timing.retry_after_secs,
+                };
+            }
+
+            let remaining = wait_deadline.saturating_duration_since(now);
+            match tokio::time::timeout(remaining, status_rx.changed()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) | Err(_) => {
+                    return LifecycleDecision::Warming {
+                        status: bootstrap_wait_status(self.state.snapshot(), stale_bootstrap_view),
+                        retry_after_secs: self.timing.retry_after_secs,
+                    };
+                }
+            }
         }
     }
 }
 
 impl<W, S, H, T, C, P> LifecycleOrchestrator for LifecycleManager<W, S, H, T, C, P>
 where
-    W: WakeRequester,
-    S: SshReadinessProbe,
-    H: HelperRpc,
-    T: TunnelOwner,
-    C: Clock,
-    P: BackendStatePublisher,
+    W: WakeRequester + Send + Sync + 'static,
+    S: SshReadinessProbe + Send + Sync + 'static,
+    H: HelperRpc + Send + Sync + 'static,
+    T: TunnelOwner + Send + Sync + 'static,
+    C: Clock + Send + Sync + 'static,
+    P: BackendStatePublisher + Send + Sync + 'static,
 {
     fn ensure_backend(&self, request: LifecycleRequest) -> LifecycleFuture<'_, LifecycleDecision> {
         Box::pin(async move {
-            let _guard = self.orchestration_lock.lock().await;
-            let mut status = self.state.snapshot();
+            let initial_status = self.core.state.snapshot();
+            let bootstrap_active = self.core.bootstrap.lock().await.active;
 
-            let ssh_ready = match self.ssh.is_ready().await {
-                Ok(ready) => ready,
-                Err(error) => {
-                    status.lifecycle = LifecycleState::Error;
-                    self.state.publish(status.clone());
-                    return LifecycleDecision::Failed { status, error };
-                }
-            };
-
-            if !ssh_ready {
-                if should_request_wake(status.lifecycle) {
-                    status.last_wake_attempt_at = Some(self.clock.now());
-                    status.tunnel = TunnelState::Down;
-
-                    if let Err(error) = self.wake.request_wake(&request).await {
-                        status.lifecycle = LifecycleState::Error;
-                        self.state.publish(status.clone());
+            if !bootstrap_active && backend_is_ready(&initial_status) {
+                match self
+                    .core
+                    .observe_once(None, request.clone(), initial_status.clone())
+                    .await
+                {
+                    ready @ LifecycleDecision::Ready(_) => return ready,
+                    LifecycleDecision::Failed { status, error } => {
+                        self.core.publish(status.clone());
                         return LifecycleDecision::Failed { status, error };
                     }
-                }
-
-                status.lifecycle = LifecycleState::Warming;
-                status.tunnel = TunnelState::Down;
-                self.state.publish(status.clone());
-                return LifecycleDecision::Warming {
-                    status,
-                    retry_after_secs: self.retry_after_secs,
-                };
-            }
-
-            let observed = match self.helper.observe_backend(&request).await {
-                Ok(observed) => observed,
-                Err(error) => {
-                    status.lifecycle = LifecycleState::Error;
-                    status.tunnel = TunnelState::Down;
-                    self.state.publish(status.clone());
-                    return LifecycleDecision::Failed { status, error };
-                }
-            };
-
-            status.lifecycle = observed.lifecycle;
-            status.chat = observed.chat;
-            status.embeddings = observed.embeddings;
-            status.embeddings_reason = observed.embeddings_reason;
-            status.llama_server_unit = observed.llama_server_unit;
-            status.inhibit_unit = observed.inhibit_unit;
-
-            if matches!(status.lifecycle, LifecycleState::Error) {
-                status.tunnel = TunnelState::Down;
-                let error = LifecycleError::new(
-                    observed
-                        .error
-                        .unwrap_or_else(|| "backend reported error state".to_string()),
-                );
-                self.state.publish(status.clone());
-                return LifecycleDecision::Failed { status, error };
-            }
-
-            if !matches!(status.lifecycle, LifecycleState::Ready) {
-                status.tunnel = TunnelState::Down;
-                self.state.publish(status.clone());
-                return LifecycleDecision::Warming {
-                    status,
-                    retry_after_secs: self.retry_after_secs,
-                };
-            }
-
-            status.tunnel = match self.tunnel.ensure_tunnel().await {
-                Ok(tunnel_state) => tunnel_state,
-                Err(error) => {
-                    status.lifecycle = LifecycleState::Error;
-                    status.tunnel = TunnelState::Down;
-                    self.state.publish(status.clone());
-                    return LifecycleDecision::Failed { status, error };
-                }
-            };
-
-            if !matches!(status.tunnel, TunnelState::Ready) {
-                status.lifecycle = LifecycleState::Warming;
-            }
-
-            self.state.publish(status.clone());
-
-            if matches!(status.lifecycle, LifecycleState::Ready)
-                && matches!(status.tunnel, TunnelState::Ready)
-            {
-                LifecycleDecision::Ready(status)
-            } else {
-                LifecycleDecision::Warming {
-                    status,
-                    retry_after_secs: self.retry_after_secs,
+                    LifecycleDecision::Warming { .. } => {}
                 }
             }
+
+            let (should_start, status_rx, initial_status) = self
+                .core
+                .start_or_join_bootstrap(initial_status, &request)
+                .await;
+
+            if should_start {
+                let observe_request = self.core.bootstrap_observe_request().await;
+                match self
+                    .core
+                    .observe_once(Some(&request), observe_request, initial_status)
+                    .await
+                {
+                    ready @ LifecycleDecision::Ready(_) => {
+                        self.core.finish_bootstrap(self.core.state.snapshot(), None).await;
+                        return ready;
+                    }
+                    LifecycleDecision::Failed { status, error } => {
+                        self.core.finish_bootstrap(status.clone(), Some(error.clone())).await;
+                        return LifecycleDecision::Failed { status, error };
+                    }
+                    LifecycleDecision::Warming { .. } => {
+                        let core = self.core.clone();
+                        tokio::spawn(async move {
+                            core.start_bootstrap().await;
+                        });
+                    }
+                }
+            }
+
+            self.core.wait_for_ready_or_timeout(status_rx).await
         })
     }
 
     fn status(&self) -> BackendStatus {
-        self.state.snapshot()
+        self.core.state.snapshot()
     }
 }
 
@@ -305,30 +582,81 @@ fn should_request_wake(lifecycle: LifecycleState) -> bool {
     )
 }
 
+fn backend_is_ready(status: &BackendStatus) -> bool {
+    matches!(status.lifecycle, LifecycleState::Ready)
+        && matches!(status.tunnel, TunnelState::Ready)
+}
+
+fn request_priority(request: &LifecycleRequest) -> u8 {
+    match request {
+        LifecycleRequest::Chat => 0,
+        LifecycleRequest::Embeddings => 1,
+    }
+}
+
+fn bootstrap_wait_status(mut status: BackendStatus, stale_bootstrap_view: bool) -> BackendStatus {
+    if stale_bootstrap_view {
+        status.lifecycle = LifecycleState::Warming;
+        status.tunnel = TunnelState::Down;
+    }
+
+    status
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    use tokio::time::sleep;
 
     use super::*;
 
     const FAKE_NOW: u64 = 1_717_156_800;
 
+    fn warming_backend() -> ObservedBackendState {
+        ObservedBackendState {
+            lifecycle: LifecycleState::Warming,
+            chat: CapabilityState::Ready,
+            embeddings: CapabilityState::Ready,
+            embeddings_reason: None,
+            error: None,
+            llama_server_unit: UnitState::Activating,
+            inhibit_unit: UnitState::Activating,
+        }
+    }
+
+    fn fast_warming_timing() -> LifecycleTiming {
+        LifecycleTiming {
+            cold_wait_budget_secs: 0,
+            hard_boot_deadline_secs: 1,
+            bootstrap_poll_interval_millis: 10,
+            retry_after_secs: 10,
+        }
+    }
+
     #[derive(Clone, Default)]
     struct FakeWakeRequester {
-        calls: std::sync::Arc<Mutex<Vec<LifecycleRequest>>>,
+        calls: Arc<Mutex<Vec<LifecycleRequest>>>,
         error: Option<LifecycleError>,
     }
 
     impl FakeWakeRequester {
         fn with_error(message: &str) -> Self {
             Self {
-                calls: std::sync::Arc::new(Mutex::new(Vec::new())),
+                calls: Arc::new(Mutex::new(Vec::new())),
                 error: Some(LifecycleError::new(message)),
             }
         }
 
         fn call_count(&self) -> usize {
             self.calls.lock().unwrap().len()
+        }
+
+        fn requests(&self) -> Vec<LifecycleRequest> {
+            self.calls.lock().unwrap().clone()
         }
     }
 
@@ -348,28 +676,58 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
     struct FakeSshReadinessProbe {
-        ready: bool,
+        ready: Arc<AtomicBool>,
+    }
+
+    impl FakeSshReadinessProbe {
+        fn new(ready: bool) -> Self {
+            Self {
+                ready: Arc::new(AtomicBool::new(ready)),
+            }
+        }
+
+        fn set_ready(&self, ready: bool) {
+            self.ready.store(ready, Ordering::Relaxed);
+        }
     }
 
     impl SshReadinessProbe for FakeSshReadinessProbe {
         fn is_ready(&self) -> LifecycleFuture<'_, Result<bool, LifecycleError>> {
-            let ready = self.ready;
+            let ready = self.ready.load(Ordering::Relaxed);
             Box::pin(async move { Ok(ready) })
         }
     }
 
-    #[derive(Default)]
+    #[derive(Clone)]
     struct FakeHelperRpc {
-        calls: Mutex<Vec<LifecycleRequest>>,
-        observed: Option<ObservedBackendState>,
+        calls: Arc<Mutex<Vec<LifecycleRequest>>>,
+        observed: Arc<Mutex<ObservedBackendState>>,
+    }
+
+    impl Default for FakeHelperRpc {
+        fn default() -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                observed: Arc::new(Mutex::new(warming_backend())),
+            }
+        }
     }
 
     impl FakeHelperRpc {
+        fn call_count(&self) -> usize {
+            self.calls.lock().unwrap().len()
+        }
+
+        fn requests(&self) -> Vec<LifecycleRequest> {
+            self.calls.lock().unwrap().clone()
+        }
+
         fn ready() -> Self {
             Self {
-                calls: Mutex::new(Vec::new()),
-                observed: Some(ObservedBackendState {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                observed: Arc::new(Mutex::new(ObservedBackendState {
                     lifecycle: LifecycleState::Ready,
                     chat: CapabilityState::Ready,
                     embeddings: CapabilityState::Ready,
@@ -377,14 +735,14 @@ mod tests {
                     error: None,
                     llama_server_unit: UnitState::Active,
                     inhibit_unit: UnitState::Active,
-                }),
+                })),
             }
         }
 
         fn error(message: &str) -> Self {
             Self {
-                calls: Mutex::new(Vec::new()),
-                observed: Some(ObservedBackendState {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                observed: Arc::new(Mutex::new(ObservedBackendState {
                     lifecycle: LifecycleState::Error,
                     chat: CapabilityState::Ready,
                     embeddings: CapabilityState::Ready,
@@ -392,8 +750,12 @@ mod tests {
                     error: Some(message.to_string()),
                     llama_server_unit: UnitState::Failed,
                     inhibit_unit: UnitState::Unknown,
-                }),
+                })),
             }
+        }
+
+        fn set_observed(&self, observed: ObservedBackendState) {
+            *self.observed.lock().unwrap() = observed;
         }
     }
 
@@ -403,10 +765,7 @@ mod tests {
             request: &LifecycleRequest,
         ) -> LifecycleFuture<'_, Result<ObservedBackendState, LifecycleError>> {
             self.calls.lock().unwrap().push(request.clone());
-            let observed = self
-                .observed
-                .clone()
-                .expect("fake helper should have observed state");
+            let observed = self.observed.lock().unwrap().clone();
             Box::pin(async move { Ok(observed) })
         }
     }
@@ -444,7 +803,7 @@ mod tests {
 
     impl Clock for FakeClock {
         fn now(&self) -> Timestamp {
-            self.now.clone()
+            self.now
         }
     }
 
@@ -480,15 +839,16 @@ mod tests {
         let wake = FakeWakeRequester::default();
         let helper = FakeHelperRpc::default();
         let state = FakeBackendStatePublisher::new(BackendStatus::default());
-        let lifecycle = LifecycleManager::new(
+        let lifecycle = LifecycleManager::new_with_timing(
             wake,
-            FakeSshReadinessProbe { ready: false },
+            FakeSshReadinessProbe::new(false),
             helper,
             FakeTunnelOwner::new(TunnelState::Down),
             FakeClock {
                 now: Timestamp::new(FAKE_NOW),
             },
             state.clone(),
+            fast_warming_timing(),
         );
 
         let decision = lifecycle.ensure_backend(LifecycleRequest::Chat).await;
@@ -515,7 +875,7 @@ mod tests {
         let state = FakeBackendStatePublisher::new(BackendStatus::default());
         let lifecycle = LifecycleManager::new(
             FakeWakeRequester::default(),
-            FakeSshReadinessProbe { ready: true },
+            FakeSshReadinessProbe::new(true),
             FakeHelperRpc::ready(),
             FakeTunnelOwner::new(TunnelState::Ready),
             FakeClock {
@@ -546,7 +906,7 @@ mod tests {
         let state = FakeBackendStatePublisher::new(BackendStatus::default());
         let lifecycle = LifecycleManager::new(
             FakeWakeRequester::with_error("wake failed"),
-            FakeSshReadinessProbe { ready: false },
+            FakeSshReadinessProbe::new(false),
             FakeHelperRpc::default(),
             FakeTunnelOwner::new(TunnelState::Down),
             FakeClock {
@@ -572,28 +932,110 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_cold_requests_share_a_single_wake() {
+    async fn concurrent_cold_requests_share_a_single_bootstrap_and_return_ready() {
         let wake = FakeWakeRequester::default();
-        let lifecycle = std::sync::Arc::new(LifecycleManager::new(
+        let ssh = FakeSshReadinessProbe::new(false);
+        let helper = FakeHelperRpc::default();
+        let lifecycle = Arc::new(LifecycleManager::new_with_timing(
             wake.clone(),
-            FakeSshReadinessProbe { ready: false },
-            FakeHelperRpc::default(),
-            FakeTunnelOwner::new(TunnelState::Down),
+            ssh.clone(),
+            helper.clone(),
+            FakeTunnelOwner::new(TunnelState::Ready),
             FakeClock {
                 now: Timestamp::new(FAKE_NOW),
             },
             FakeBackendStatePublisher::new(BackendStatus::default()),
+            LifecycleTiming {
+                cold_wait_budget_secs: 1,
+                hard_boot_deadline_secs: 1,
+                bootstrap_poll_interval_millis: 10,
+                retry_after_secs: 10,
+            },
         ));
 
-        let (first, second) = tokio::join!(
+        let toggler = tokio::spawn({
+            let ssh = ssh.clone();
+            let helper = helper.clone();
+            async move {
+                sleep(Duration::from_millis(20)).await;
+                ssh.set_ready(true);
+                helper.set_observed(ObservedBackendState {
+                    lifecycle: LifecycleState::Ready,
+                    chat: CapabilityState::Ready,
+                    embeddings: CapabilityState::Ready,
+                    embeddings_reason: None,
+                    error: None,
+                    llama_server_unit: UnitState::Active,
+                    inhibit_unit: UnitState::Active,
+                });
+            }
+        });
+
+        let (first, second, _) = tokio::join!(
             lifecycle.ensure_backend(LifecycleRequest::Chat),
-            lifecycle.ensure_backend(LifecycleRequest::Chat)
+            lifecycle.ensure_backend(LifecycleRequest::Embeddings),
+            toggler
         );
 
-        assert!(matches!(first, LifecycleDecision::Warming { .. }));
-        assert!(matches!(second, LifecycleDecision::Warming { .. }));
-
+        assert!(matches!(first, LifecycleDecision::Ready(_)));
+        assert!(matches!(second, LifecycleDecision::Ready(_)));
         assert_eq!(wake.call_count(), 1);
+        assert_eq!(wake.requests(), vec![LifecycleRequest::Chat]);
+        assert_eq!(helper.call_count(), 1);
+        assert_eq!(helper.requests(), vec![LifecycleRequest::Embeddings]);
+        assert_eq!(lifecycle.core.state.snapshot().tunnel, TunnelState::Ready);
+    }
+
+    #[tokio::test]
+    async fn embeddings_led_bootstrap_observes_embeddings_request_kind() {
+        let wake = FakeWakeRequester::default();
+        let ssh = FakeSshReadinessProbe::new(false);
+        let helper = FakeHelperRpc::default();
+        let lifecycle = Arc::new(LifecycleManager::new_with_timing(
+            wake.clone(),
+            ssh.clone(),
+            helper.clone(),
+            FakeTunnelOwner::new(TunnelState::Ready),
+            FakeClock {
+                now: Timestamp::new(FAKE_NOW),
+            },
+            FakeBackendStatePublisher::new(BackendStatus::default()),
+            LifecycleTiming {
+                cold_wait_budget_secs: 1,
+                hard_boot_deadline_secs: 1,
+                bootstrap_poll_interval_millis: 10,
+                retry_after_secs: 10,
+            },
+        ));
+
+        let toggler = tokio::spawn({
+            let ssh = ssh.clone();
+            let helper = helper.clone();
+            async move {
+                sleep(Duration::from_millis(20)).await;
+                ssh.set_ready(true);
+                helper.set_observed(ObservedBackendState {
+                    lifecycle: LifecycleState::Ready,
+                    chat: CapabilityState::Ready,
+                    embeddings: CapabilityState::Ready,
+                    embeddings_reason: None,
+                    error: None,
+                    llama_server_unit: UnitState::Active,
+                    inhibit_unit: UnitState::Active,
+                });
+            }
+        });
+
+        let (first, second, _) = tokio::join!(
+            lifecycle.ensure_backend(LifecycleRequest::Embeddings),
+            lifecycle.ensure_backend(LifecycleRequest::Chat),
+            toggler
+        );
+
+        assert!(matches!(first, LifecycleDecision::Ready(_)));
+        assert!(matches!(second, LifecycleDecision::Ready(_)));
+        assert_eq!(wake.requests(), vec![LifecycleRequest::Embeddings]);
+        assert_eq!(helper.requests(), vec![LifecycleRequest::Embeddings]);
     }
 
     #[tokio::test]
@@ -601,7 +1043,7 @@ mod tests {
         let state = FakeBackendStatePublisher::new(BackendStatus::default());
         let lifecycle = LifecycleManager::new(
             FakeWakeRequester::default(),
-            FakeSshReadinessProbe { ready: true },
+            FakeSshReadinessProbe::new(true),
             FakeHelperRpc::error("helper reported backend failure"),
             FakeTunnelOwner::new(TunnelState::Ready),
             FakeClock {
@@ -634,15 +1076,16 @@ mod tests {
             tunnel: TunnelState::Ready,
             ..BackendStatus::default()
         });
-        let lifecycle = LifecycleManager::new(
+        let lifecycle = LifecycleManager::new_with_timing(
             wake.clone(),
-            FakeSshReadinessProbe { ready: false },
+            FakeSshReadinessProbe::new(false),
             FakeHelperRpc::default(),
             FakeTunnelOwner::new(TunnelState::Ready),
             FakeClock {
                 now: Timestamp::new(FAKE_NOW),
             },
             state.clone(),
+            fast_warming_timing(),
         );
 
         let decision = lifecycle.ensure_backend(LifecycleRequest::Chat).await;
@@ -670,15 +1113,16 @@ mod tests {
             tunnel: TunnelState::Down,
             ..BackendStatus::default()
         });
-        let lifecycle = LifecycleManager::new(
+        let lifecycle = LifecycleManager::new_with_timing(
             wake.clone(),
-            FakeSshReadinessProbe { ready: false },
+            FakeSshReadinessProbe::new(false),
             FakeHelperRpc::default(),
             FakeTunnelOwner::new(TunnelState::Down),
             FakeClock {
                 now: Timestamp::new(FAKE_NOW),
             },
             state.clone(),
+            fast_warming_timing(),
         );
 
         let decision = lifecycle.ensure_backend(LifecycleRequest::Chat).await;
@@ -707,8 +1151,8 @@ mod tests {
         });
         let lifecycle = LifecycleManager::new(
             wake.clone(),
-            FakeSshReadinessProbe { ready: true },
-            helper,
+            FakeSshReadinessProbe::new(true),
+            helper.clone(),
             tunnel.clone(),
             FakeClock {
                 now: Timestamp::new(FAKE_NOW),
@@ -727,8 +1171,41 @@ mod tests {
         }
 
         assert_eq!(wake.call_count(), 0);
+        assert_eq!(helper.call_count(), 1);
         assert_eq!(tunnel.call_count(), 1);
         assert_eq!(state.latest().lifecycle, LifecycleState::Ready);
+    }
+
+    #[tokio::test]
+    async fn concurrent_warm_requests_do_not_join_bootstrap_wait_path() {
+        let wake = FakeWakeRequester::default();
+        let helper = FakeHelperRpc::ready();
+        let tunnel = FakeTunnelOwner::new(TunnelState::Ready);
+        let lifecycle = Arc::new(LifecycleManager::new(
+            wake.clone(),
+            FakeSshReadinessProbe::new(true),
+            helper.clone(),
+            tunnel.clone(),
+            FakeClock {
+                now: Timestamp::new(FAKE_NOW),
+            },
+            FakeBackendStatePublisher::new(BackendStatus {
+                lifecycle: LifecycleState::Ready,
+                tunnel: TunnelState::Ready,
+                ..BackendStatus::default()
+            }),
+        ));
+
+        let (first, second) = tokio::join!(
+            lifecycle.ensure_backend(LifecycleRequest::Chat),
+            lifecycle.ensure_backend(LifecycleRequest::Embeddings)
+        );
+
+        assert!(matches!(first, LifecycleDecision::Ready(_)));
+        assert!(matches!(second, LifecycleDecision::Ready(_)));
+        assert_eq!(wake.call_count(), 0);
+        assert_eq!(helper.call_count(), 2);
+        assert_eq!(tunnel.call_count(), 2);
     }
 
     #[tokio::test]
@@ -739,7 +1216,7 @@ mod tests {
         let state = FakeBackendStatePublisher::new(BackendStatus::default());
         let lifecycle = LifecycleManager::new(
             wake.clone(),
-            FakeSshReadinessProbe { ready: true },
+            FakeSshReadinessProbe::new(true),
             helper,
             tunnel.clone(),
             FakeClock {
@@ -763,5 +1240,172 @@ mod tests {
         assert_eq!(wake.call_count(), 0);
         assert_eq!(tunnel.call_count(), 1);
         assert_eq!(state.latest().lifecycle, LifecycleState::Ready);
+    }
+
+    #[tokio::test]
+    async fn request_times_out_but_background_bootstrap_keeps_running() {
+        let wake = FakeWakeRequester::default();
+        let ssh = FakeSshReadinessProbe::new(false);
+        let helper = FakeHelperRpc::default();
+        let state = FakeBackendStatePublisher::new(BackendStatus::default());
+        let lifecycle = LifecycleManager::new_with_timing(
+            wake.clone(),
+            ssh.clone(),
+            helper.clone(),
+            FakeTunnelOwner::new(TunnelState::Ready),
+            FakeClock {
+                now: Timestamp::new(FAKE_NOW),
+            },
+            state.clone(),
+            fast_warming_timing(),
+        );
+
+        let decision = lifecycle.ensure_backend(LifecycleRequest::Chat).await;
+        assert!(matches!(decision, LifecycleDecision::Warming { .. }));
+
+        ssh.set_ready(true);
+        helper.set_observed(ObservedBackendState {
+            lifecycle: LifecycleState::Ready,
+            chat: CapabilityState::Ready,
+            embeddings: CapabilityState::Ready,
+            embeddings_reason: None,
+            error: None,
+            llama_server_unit: UnitState::Active,
+            inhibit_unit: UnitState::Active,
+        });
+
+        sleep(Duration::from_millis(30)).await;
+
+        let latest = state.latest();
+        assert_eq!(latest.lifecycle, LifecycleState::Ready);
+        assert_eq!(latest.tunnel, TunnelState::Ready);
+        assert_eq!(wake.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn background_bootstrap_fails_at_hard_deadline_after_request_timeout() {
+        let state = FakeBackendStatePublisher::new(BackendStatus::default());
+        let lifecycle = LifecycleManager::new_with_timing(
+            FakeWakeRequester::default(),
+            FakeSshReadinessProbe::new(false),
+            FakeHelperRpc::default(),
+            FakeTunnelOwner::new(TunnelState::Ready),
+            FakeClock {
+                now: Timestamp::new(FAKE_NOW),
+            },
+            state.clone(),
+            LifecycleTiming {
+                cold_wait_budget_secs: 0,
+                hard_boot_deadline_secs: 0,
+                bootstrap_poll_interval_millis: 1,
+                retry_after_secs: 10,
+            },
+        );
+
+        let decision = lifecycle.ensure_backend(LifecycleRequest::Chat).await;
+        assert!(matches!(decision, LifecycleDecision::Warming { .. }));
+
+        sleep(Duration::from_millis(20)).await;
+
+        let latest = state.latest();
+        assert_eq!(latest.lifecycle, LifecycleState::Error);
+        assert_eq!(latest.tunnel, TunnelState::Down);
+    }
+
+    #[tokio::test]
+    async fn joiner_does_not_observe_stale_ready_during_retry_bootstrap() {
+        let wake = FakeWakeRequester::default();
+        let ssh = FakeSshReadinessProbe::new(false);
+        let lifecycle = Arc::new(LifecycleManager::new_with_timing(
+            wake.clone(),
+            ssh,
+            FakeHelperRpc::default(),
+            FakeTunnelOwner::new(TunnelState::Down),
+            FakeClock {
+                now: Timestamp::new(FAKE_NOW),
+            },
+            FakeBackendStatePublisher::new(BackendStatus {
+                lifecycle: LifecycleState::Ready,
+                tunnel: TunnelState::Ready,
+                ..BackendStatus::default()
+            }),
+            fast_warming_timing(),
+        ));
+
+        let (first, second) = tokio::join!(
+            lifecycle.ensure_backend(LifecycleRequest::Chat),
+            lifecycle.ensure_backend(LifecycleRequest::Embeddings)
+        );
+
+        assert!(matches!(first, LifecycleDecision::Warming { .. }));
+        assert!(matches!(second, LifecycleDecision::Warming { .. }));
+        assert_eq!(wake.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn joiner_does_not_observe_stale_error_during_retry_bootstrap() {
+        let wake = FakeWakeRequester::default();
+        let ssh = FakeSshReadinessProbe::new(false);
+        let lifecycle = Arc::new(LifecycleManager::new_with_timing(
+            wake.clone(),
+            ssh,
+            FakeHelperRpc::default(),
+            FakeTunnelOwner::new(TunnelState::Down),
+            FakeClock {
+                now: Timestamp::new(FAKE_NOW),
+            },
+            FakeBackendStatePublisher::new(BackendStatus {
+                lifecycle: LifecycleState::Error,
+                tunnel: TunnelState::Down,
+                ..BackendStatus::default()
+            }),
+            fast_warming_timing(),
+        ));
+
+        let (first, second) = tokio::join!(
+            lifecycle.ensure_backend(LifecycleRequest::Chat),
+            lifecycle.ensure_backend(LifecycleRequest::Embeddings)
+        );
+
+        assert!(matches!(first, LifecycleDecision::Warming { .. }));
+        assert!(matches!(second, LifecycleDecision::Warming { .. }));
+        assert_eq!(wake.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_waiters_receive_specific_boot_deadline_failure_reason() {
+        let lifecycle = Arc::new(LifecycleManager::new_with_timing(
+            FakeWakeRequester::default(),
+            FakeSshReadinessProbe::new(false),
+            FakeHelperRpc::default(),
+            FakeTunnelOwner::new(TunnelState::Ready),
+            FakeClock {
+                now: Timestamp::new(FAKE_NOW),
+            },
+            FakeBackendStatePublisher::new(BackendStatus::default()),
+            LifecycleTiming {
+                cold_wait_budget_secs: 1,
+                hard_boot_deadline_secs: 0,
+                bootstrap_poll_interval_millis: 1,
+                retry_after_secs: 10,
+            },
+        ));
+
+        let (first, second) = tokio::join!(
+            lifecycle.ensure_backend(LifecycleRequest::Chat),
+            lifecycle.ensure_backend(LifecycleRequest::Embeddings)
+        );
+
+        let expected = "backend did not become ready before the boot deadline";
+
+        match first {
+            LifecycleDecision::Failed { error, .. } => assert_eq!(error.message, expected),
+            other => panic!("expected failed decision, got {other:?}"),
+        }
+
+        match second {
+            LifecycleDecision::Failed { error, .. } => assert_eq!(error.message, expected),
+            other => panic!("expected failed decision, got {other:?}"),
+        }
     }
 }
