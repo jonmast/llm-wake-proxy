@@ -5,7 +5,7 @@ use std::{
 
 use crate::{
     config::AppConfig,
-    host::{SshHelperRpc, SshTcpProbe, WolWakeRequester},
+    host::{SshHelperRpc, SshTcpProbe, SshTunnelManager, WolWakeRequester},
     lifecycle::{
         BackendStatePublisher, BackendStatus, Clock, HelperRpc, LifecycleError, LifecycleFuture,
         LifecycleManager, LifecycleOrchestrator, LifecycleRequest, LifecycleState,
@@ -60,7 +60,12 @@ impl AppState {
             config.host.model_path.clone(),
             config.model.alias.clone(),
         );
-        let tunnel = NoopTunnelOwner;
+        let tunnel = SshTunnelManager::new(
+            config.host.ssh_user.clone(),
+            config.host.host.clone(),
+            config.host.tunnel_local_port,
+            config.host.remote_port,
+        );
 
         let lifecycle = Arc::new(LifecycleManager::new(
             wake,

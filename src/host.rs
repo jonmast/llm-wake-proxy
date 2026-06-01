@@ -3,7 +3,8 @@ use std::time::Duration;
 use crate::helper::{HelperStatus, StatusResponse};
 use crate::lifecycle::{
     CapabilityState, HelperRpc, LifecycleError, LifecycleFuture, LifecycleRequest,
-    LifecycleState, ObservedBackendState, SshReadinessProbe, WakeRequester,
+    LifecycleState, ObservedBackendState, SshReadinessProbe, TunnelOwner, TunnelState,
+    WakeRequester,
 };
 
 // ===== Wake-on-LAN =====
@@ -268,6 +269,99 @@ fn map_unit_state(active_state: Option<&str>) -> crate::lifecycle::UnitState {
         Some("inactive") => crate::lifecycle::UnitState::Inactive,
         Some("failed" | "error") => crate::lifecycle::UnitState::Failed,
         _ => crate::lifecycle::UnitState::Unknown,
+    }
+}
+
+// ===== SSH Tunnel Manager =====
+
+use tokio::sync::Mutex;
+use tokio::process::Child;
+
+pub struct SshTunnelManager {
+    ssh_user: String,
+    ssh_host: String,
+    local_port: u16,
+    remote_port: u16,
+    proc: Mutex<Option<Child>>,
+}
+
+impl SshTunnelManager {
+    pub fn new(ssh_user: String, ssh_host: String, local_port: u16, remote_port: u16) -> Self {
+        Self {
+            ssh_user,
+            ssh_host,
+            local_port,
+            remote_port,
+            proc: Mutex::new(None),
+        }
+    }
+
+    async fn create_tunnel(&self) -> Result<Child, LifecycleError> {
+        let mut child = tokio::process::Command::new("ssh")
+            .args([
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+                "ExitOnForwardFailure=yes",
+                "-L",
+                &format!(
+                    "127.0.0.1:{}:127.0.0.1:{}",
+                    self.local_port, self.remote_port
+                ),
+                "-N",
+                &format!("{}@{}", self.ssh_user, self.ssh_host),
+            ])
+            .spawn()
+            .map_err(|e| LifecycleError::new(format!("failed to spawn SSH tunnel: {e}")))?;
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        match child.try_wait() {
+            Ok(Some(status)) => Err(LifecycleError::new(format!(
+                "SSH tunnel exited immediately with status: {status}"
+            ))),
+            Ok(None) => Ok(child),
+            Err(e) => Err(LifecycleError::new(format!(
+                "failed to check tunnel: {e}"
+            ))),
+        }
+    }
+}
+
+impl TunnelOwner for SshTunnelManager {
+    fn ensure_tunnel(&self) -> LifecycleFuture<'_, Result<TunnelState, LifecycleError>> {
+        Box::pin(async move {
+            let mut proc = self.proc.lock().await;
+
+            if let Some(ref mut child) = *proc {
+                match child.try_wait() {
+                    Ok(Some(_)) => {
+                        *proc = None;
+                        match self.create_tunnel().await {
+                            Ok(c) => {
+                                *proc = Some(c);
+                                Ok(TunnelState::Ready)
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    Ok(None) => Ok(TunnelState::Ready),
+                    Err(_) => Ok(TunnelState::Down),
+                }
+            } else {
+                match self.create_tunnel().await {
+                    Ok(child) => {
+                        *proc = Some(child);
+                        Ok(TunnelState::Ready)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+        })
     }
 }
 
