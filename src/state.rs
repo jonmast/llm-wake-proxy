@@ -5,6 +5,7 @@ use std::{
 
 use crate::{
     config::AppConfig,
+    host::{SshHelperRpc, SshTcpProbe, WolWakeRequester},
     lifecycle::{
         BackendStatePublisher, BackendStatus, Clock, HelperRpc, LifecycleError, LifecycleFuture,
         LifecycleManager, LifecycleOrchestrator, LifecycleRequest, LifecycleState,
@@ -30,6 +31,42 @@ impl AppState {
             NoopSshReadinessProbe,
             NoopHelperRpc,
             NoopTunnelOwner,
+            SystemClock,
+            SharedBackendState::new(backend.clone()),
+        ));
+        let scheduler = WarmExecutionScheduler::new(config.warm_execution.clone());
+
+        Self {
+            config,
+            backend,
+            lifecycle,
+            scheduler,
+        }
+    }
+
+    pub fn production(config: AppConfig) -> Self {
+        let backend = Arc::new(RwLock::new(BackendStatus::default()));
+
+        let wake = WolWakeRequester::new(
+            config.host.wol_mac,
+            config.host.wol_broadcast.clone(),
+            config.host.wol_port,
+        );
+        let ssh = SshTcpProbe::new(config.host.host.clone(), config.host.ssh_port);
+        let helper = SshHelperRpc::new(
+            config.host.ssh_user.clone(),
+            config.host.host.clone(),
+            config.host.helper_path.clone(),
+            config.host.model_path.clone(),
+            config.model.alias.clone(),
+        );
+        let tunnel = NoopTunnelOwner;
+
+        let lifecycle = Arc::new(LifecycleManager::new(
+            wake,
+            ssh,
+            helper,
+            tunnel,
             SystemClock,
             SharedBackendState::new(backend.clone()),
         ));
@@ -134,7 +171,7 @@ impl HelperRpc for NoopHelperRpc {
     }
 }
 
-struct NoopTunnelOwner;
+pub(crate) struct NoopTunnelOwner;
 
 impl TunnelOwner for NoopTunnelOwner {
     fn ensure_tunnel(&self) -> LifecycleFuture<'_, Result<TunnelState, LifecycleError>> {

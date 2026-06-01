@@ -608,6 +608,8 @@ mod tests {
     }
 
     fn test_config() -> AppConfig {
+        use crate::config::HostConfig;
+
         AppConfig {
             listen_port: 3000,
             model: ModelConfig {
@@ -617,6 +619,7 @@ mod tests {
             },
             embeddings: EmbeddingsConfig { enabled: true },
             warm_execution: WarmExecutionConfig::default(),
+            host: HostConfig::default(),
         }
     }
 
@@ -1085,6 +1088,8 @@ mod tests {
 
     #[tokio::test]
     async fn embeddings_can_be_disabled_independently() {
+        use crate::config::HostConfig;
+
         let state = AppState::new(AppConfig {
             listen_port: 3000,
             model: ModelConfig {
@@ -1094,6 +1099,7 @@ mod tests {
             },
             embeddings: EmbeddingsConfig { enabled: false },
             warm_execution: WarmExecutionConfig::default(),
+            host: HostConfig::default(),
         });
         let app = build_router(state);
 

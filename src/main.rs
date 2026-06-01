@@ -11,7 +11,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let config = AppConfig::from_env();
-    let app = build_router(AppState::new(config.clone()));
+    let app = build_router(AppState::production(config.clone()));
     let addr = SocketAddr::from(([0, 0, 0, 0], config.listen_port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
 

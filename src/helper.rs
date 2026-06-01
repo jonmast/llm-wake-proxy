@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::process::Command;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HelperStatus {
     Ok,
@@ -11,7 +11,7 @@ pub enum HelperStatus {
     Error,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnitInfo {
     pub unit_name: String,
     pub active_state: String,
@@ -19,7 +19,7 @@ pub struct UnitInfo {
     pub description: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelInfo {
     pub model_alias: String,
     pub model_path: String,
@@ -28,7 +28,7 @@ pub struct ModelInfo {
     pub reported_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusResponse {
     pub status: HelperStatus,
     pub message: String,
@@ -37,7 +37,7 @@ pub struct StatusResponse {
     pub active_model: Option<ModelInfo>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnsureStartedResponse {
     pub status: HelperStatus,
     pub message: String,

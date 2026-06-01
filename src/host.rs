@@ -1,0 +1,305 @@
+use std::time::Duration;
+
+use crate::helper::{HelperStatus, StatusResponse};
+use crate::lifecycle::{
+    CapabilityState, HelperRpc, LifecycleError, LifecycleFuture, LifecycleRequest,
+    LifecycleState, ObservedBackendState, SshReadinessProbe, WakeRequester,
+};
+
+// ===== Wake-on-LAN =====
+
+#[derive(Clone, Debug)]
+pub struct WolWakeRequester {
+    mac: [u8; 6],
+    broadcast: String,
+    port: u16,
+}
+
+impl WolWakeRequester {
+    pub fn new(mac: [u8; 6], broadcast: String, port: u16) -> Self {
+        Self { mac, broadcast, port }
+    }
+}
+
+impl WakeRequester for WolWakeRequester {
+    fn request_wake(
+        &self,
+        _request: &LifecycleRequest,
+    ) -> LifecycleFuture<'_, Result<(), LifecycleError>> {
+        let mac = self.mac;
+        let broadcast = self.broadcast.clone();
+        let port = self.port;
+        Box::pin(async move {
+            let mut packet = Vec::with_capacity(102);
+            packet.extend_from_slice(&[0xFF; 6]);
+            for _ in 0..16 {
+                packet.extend_from_slice(&mac);
+            }
+
+            let socket = tokio::net::UdpSocket::bind("0.0.0.0:0")
+                .await
+                .map_err(|e| LifecycleError::new(format!("WOL bind failed: {e}")))?;
+            socket
+                .set_broadcast(true)
+                .map_err(|e| LifecycleError::new(format!("WOL broadcast failed: {e}")))?;
+            socket
+                .send_to(&packet, format!("{broadcast}:{port}"))
+                .await
+                .map_err(|e| LifecycleError::new(format!("WOL send failed: {e}")))?;
+            Ok(())
+        })
+    }
+}
+
+// ===== SSH Readiness Probe =====
+
+#[derive(Clone, Debug)]
+pub struct SshTcpProbe {
+    host: String,
+    port: u16,
+}
+
+impl SshTcpProbe {
+    pub fn new(host: String, port: u16) -> Self {
+        Self { host, port }
+    }
+}
+
+impl SshReadinessProbe for SshTcpProbe {
+    fn is_ready(&self) -> LifecycleFuture<'_, Result<bool, LifecycleError>> {
+        let addr = format!("{}:{}", self.host, self.port);
+        Box::pin(async move {
+            match tokio::time::timeout(
+                Duration::from_secs(10),
+                tokio::net::TcpStream::connect(&addr),
+            )
+            .await
+            {
+                Ok(Ok(_)) => Ok(true),
+                _ => Ok(false),
+            }
+        })
+    }
+}
+
+// ===== SSH Helper RPC =====
+
+#[derive(Clone, Debug)]
+pub struct SshHelperRpc {
+    ssh_user: String,
+    ssh_host: String,
+    helper_path: String,
+    model_path: String,
+    model_alias: String,
+}
+
+impl SshHelperRpc {
+    pub fn new(
+        ssh_user: String,
+        ssh_host: String,
+        helper_path: String,
+        model_path: String,
+        model_alias: String,
+    ) -> Self {
+        Self {
+            ssh_user,
+            ssh_host,
+            helper_path,
+            model_path,
+            model_alias,
+        }
+    }
+
+    async fn run_helper_cmd(&self, args: &[&str]) -> Result<String, LifecycleError> {
+        let mut cmd = tokio::process::Command::new("ssh");
+        cmd.args([
+            "-o",
+            "ConnectTimeout=10",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+        ]);
+        cmd.arg(format!("{}@{}", self.ssh_user, self.ssh_host));
+        for arg in args {
+            cmd.arg(arg);
+        }
+
+        let output = cmd
+            .output()
+            .await
+            .map_err(|e| LifecycleError::new(format!("ssh failed: {e}")))?;
+
+        if output.status.success() {
+            String::from_utf8(output.stdout)
+                .map_err(|e| LifecycleError::new(format!("invalid UTF-8 from helper: {e}")))
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(LifecycleError::new(format!(
+                "helper command failed: {stderr}"
+            )))
+        }
+    }
+
+    async fn ensure_started(&self) -> Result<ObservedBackendState, LifecycleError> {
+        let output = self
+            .run_helper_cmd(&[
+                "env",
+                &format!("EXPECTED_MODEL_PATH={}", self.model_path),
+                &self.helper_path,
+                "ensure-started",
+                &self.model_alias,
+            ])
+            .await?;
+
+        let ensure: crate::helper::EnsureStartedResponse =
+            serde_json::from_str(&output).map_err(|e| {
+                LifecycleError::new(format!("failed to parse ensure-started response: {e}"))
+            })?;
+
+        let lifecycle = match ensure.status {
+            HelperStatus::Ok if ensure.model_verified => LifecycleState::Ready,
+            HelperStatus::Ok => LifecycleState::Warming,
+            _ => LifecycleState::Error,
+        };
+
+        let error = match ensure.status {
+            HelperStatus::Ok => None,
+            _ => Some(ensure.message.clone()),
+        };
+
+        let llama_server_unit = map_unit_state(
+            ensure
+                .llama_server
+                .as_ref()
+                .map(|u| u.active_state.as_str()),
+        );
+
+        Ok(ObservedBackendState {
+            lifecycle,
+            chat: CapabilityState::Ready,
+            embeddings: CapabilityState::Ready,
+            embeddings_reason: None,
+            error,
+            llama_server_unit,
+            inhibit_unit: crate::lifecycle::UnitState::Unknown,
+        })
+    }
+
+    async fn fetch_status(&self) -> Result<ObservedBackendState, LifecycleError> {
+        let output = self
+            .run_helper_cmd(&[&self.helper_path, "status"])
+            .await?;
+
+        let parsed: StatusResponse = serde_json::from_str(&output)
+            .map_err(|e| LifecycleError::new(format!("failed to parse status response: {e}")))?;
+
+        let llama_server_unit = map_unit_state(
+            parsed
+                .llama_server
+                .as_ref()
+                .map(|u| u.active_state.as_str()),
+        );
+        let inhibit_unit = map_unit_state(
+            parsed
+                .inhibit_holder
+                .as_ref()
+                .map(|u| u.active_state.as_str()),
+        );
+
+        let lifecycle = if matches!(parsed.status, HelperStatus::Error) {
+            LifecycleState::Error
+        } else if llama_server_unit == crate::lifecycle::UnitState::Active {
+            LifecycleState::Ready
+        } else {
+            LifecycleState::Warming
+        };
+
+        Ok(ObservedBackendState {
+            lifecycle,
+            chat: CapabilityState::Ready,
+            embeddings: CapabilityState::Ready,
+            embeddings_reason: None,
+            error: None,
+            llama_server_unit,
+            inhibit_unit,
+        })
+    }
+}
+
+impl HelperRpc for SshHelperRpc {
+    fn observe_backend(
+        &self,
+        _request: &LifecycleRequest,
+    ) -> LifecycleFuture<'_, Result<ObservedBackendState, LifecycleError>> {
+        let ssh_user = self.ssh_user.clone();
+        let ssh_host = self.ssh_host.clone();
+        let helper_path = self.helper_path.clone();
+        let model_path = self.model_path.clone();
+        let model_alias = self.model_alias.clone();
+
+        Box::pin(async move {
+            let rpc = SshHelperRpc {
+                ssh_user,
+                ssh_host,
+                helper_path,
+                model_path,
+                model_alias,
+            };
+
+            let mut state = rpc.ensure_started().await?;
+
+            if matches!(state.lifecycle, LifecycleState::Ready) {
+                if let Ok(status_state) = rpc.fetch_status().await {
+                    state.llama_server_unit = status_state.llama_server_unit;
+                    state.inhibit_unit = status_state.inhibit_unit;
+                }
+            }
+
+            Ok(state)
+        })
+    }
+}
+
+fn map_unit_state(active_state: Option<&str>) -> crate::lifecycle::UnitState {
+    match active_state {
+        Some("active") => crate::lifecycle::UnitState::Active,
+        Some("activating" | "reloading") => crate::lifecycle::UnitState::Activating,
+        Some("inactive") => crate::lifecycle::UnitState::Inactive,
+        Some("failed" | "error") => crate::lifecycle::UnitState::Failed,
+        _ => crate::lifecycle::UnitState::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn map_unit_state_known_values() {
+        assert_eq!(
+            map_unit_state(Some("active")),
+            crate::lifecycle::UnitState::Active
+        );
+        assert_eq!(
+            map_unit_state(Some("inactive")),
+            crate::lifecycle::UnitState::Inactive
+        );
+        assert_eq!(
+            map_unit_state(Some("activating")),
+            crate::lifecycle::UnitState::Activating
+        );
+        assert_eq!(
+            map_unit_state(Some("failed")),
+            crate::lifecycle::UnitState::Failed
+        );
+        assert_eq!(
+            map_unit_state(None),
+            crate::lifecycle::UnitState::Unknown
+        );
+        assert_eq!(
+            map_unit_state(Some("garbage")),
+            crate::lifecycle::UnitState::Unknown
+        );
+    }
+}
