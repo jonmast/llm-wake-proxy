@@ -49,10 +49,46 @@ pub struct EnsureStartedResponse {
     pub llama_server: Option<UnitInfo>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct LeaseAcquireResponse {
+    pub status: HelperStatus,
+    pub message: String,
+    pub inhibit_holder: Option<UnitInfo>,
+    pub ttl_secs: u64,
+    pub renewed: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LeaseReleaseResponse {
+    pub status: HelperStatus,
+    pub message: String,
+    pub inhibit_holder: Option<UnitInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LeaseInspectResponse {
+    pub status: HelperStatus,
+    pub message: String,
+    pub inhibit_holder: Option<UnitInfo>,
+}
+
 pub trait SystemdControl: Send + Sync {
     fn show_unit(&self, unit: &str) -> Result<HashMap<String, String>, String>;
     fn is_active(&self, unit: &str) -> Result<bool, String>;
     fn start_unit(&self, unit: &str) -> Result<(), String>;
+    fn stop_unit(&self, unit: &str) -> Result<(), String> {
+        let _ = unit;
+        Err("stop_unit not implemented".to_string())
+    }
+    fn replace_transient_unit(
+        &self,
+        unit: &str,
+        description: &str,
+        args: &[&str],
+    ) -> Result<(), String> {
+        let _ = (unit, description, args);
+        Err("replace_transient_unit not implemented".to_string())
+    }
 }
 
 pub trait ServerCheck: Send + Sync {
@@ -99,6 +135,47 @@ impl SystemdControl for RealSystemd {
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
             Err(format!("systemctl start failed: {stderr}"))
+        }
+    }
+
+    fn stop_unit(&self, unit: &str) -> Result<(), String> {
+        let output = Command::new("systemctl")
+            .args(["--user", "stop", unit])
+            .output()
+            .map_err(|e| format!("failed to run systemctl: {e}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(format!("systemctl stop failed: {stderr}"))
+        }
+    }
+
+    fn replace_transient_unit(
+        &self,
+        unit: &str,
+        description: &str,
+        args: &[&str],
+    ) -> Result<(), String> {
+        let mut cmd = Command::new("systemd-run");
+        cmd.args([
+            "--user",
+            "--unit",
+            unit,
+            "--replace",
+            "--description",
+            description,
+            "--collect",
+        ]);
+        cmd.args(args);
+        let output = cmd
+            .output()
+            .map_err(|e| format!("failed to run systemd-run: {e}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(format!("systemd-run failed: {stderr}"))
         }
     }
 }
@@ -383,6 +460,113 @@ impl Helper {
             server_ready,
             model_verified,
             llama_server: Some(unit_info),
+        }
+    }
+
+    pub fn lease_acquire(&self, ttl_secs: u64) -> LeaseAcquireResponse {
+        let ttl_secs = ttl_secs.clamp(60, 86_400);
+        let was_active = self
+            .sys
+            .is_active(&self.config.inhibit_holder_unit)
+            .unwrap_or(false);
+
+        match self.sys.replace_transient_unit(
+            &self.config.inhibit_holder_unit,
+            "llm-wake-proxy inhibit holder",
+            &[
+                "systemd-inhibit",
+                "--what=sleep",
+                "--who=llm-wake-proxy",
+                "--why=Keep awake for active proxy session",
+                "sleep",
+                &ttl_secs.to_string(),
+            ],
+        ) {
+            Ok(()) => {
+                let unit = self.collect_unit_info(&self.config.inhibit_holder_unit);
+                let is_verified_active = unit
+                    .as_ref()
+                    .map(|u| u.active_state == "active")
+                    .unwrap_or(false);
+
+                if !is_verified_active {
+                    return LeaseAcquireResponse {
+                        status: HelperStatus::Error,
+                        message: "lease was created but the inhibit unit is not active".to_string(),
+                        inhibit_holder: unit,
+                        ttl_secs,
+                        renewed: false,
+                    };
+                }
+
+                LeaseAcquireResponse {
+                    status: HelperStatus::Ok,
+                    message: if was_active {
+                        "lease renewed".to_string()
+                    } else {
+                        "lease acquired".to_string()
+                    },
+                    inhibit_holder: unit,
+                    ttl_secs,
+                    renewed: was_active,
+                }
+            }
+            Err(e) => LeaseAcquireResponse {
+                status: HelperStatus::Error,
+                message: format!("failed to acquire lease: {e}"),
+                inhibit_holder: None,
+                ttl_secs,
+                renewed: false,
+            },
+        }
+    }
+
+    pub fn lease_release(&self) -> LeaseReleaseResponse {
+        match self.sys.stop_unit(&self.config.inhibit_holder_unit) {
+            Ok(()) => {
+                let unit = self.collect_unit_info(&self.config.inhibit_holder_unit);
+                LeaseReleaseResponse {
+                    status: HelperStatus::Ok,
+                    message: "lease released".to_string(),
+                    inhibit_holder: unit,
+                }
+            }
+            Err(e) => LeaseReleaseResponse {
+                status: HelperStatus::Error,
+                message: format!("failed to release lease: {e}"),
+                inhibit_holder: None,
+            },
+        }
+    }
+
+    pub fn lease_inspect(&self) -> LeaseInspectResponse {
+        match self.sys.show_unit(&self.config.inhibit_holder_unit) {
+            Ok(props) => {
+                let active_state = props
+                    .get("ActiveState")
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".to_string());
+                let sub_state = props
+                    .get("SubState")
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".to_string());
+                let description = props.get("Description").cloned().unwrap_or_default();
+                LeaseInspectResponse {
+                    status: HelperStatus::Ok,
+                    message: "current lease state".to_string(),
+                    inhibit_holder: Some(UnitInfo {
+                        unit_name: self.config.inhibit_holder_unit.clone(),
+                        active_state,
+                        sub_state,
+                        description,
+                    }),
+                }
+            }
+            Err(e) => LeaseInspectResponse {
+                status: HelperStatus::Error,
+                message: format!("failed to inspect lease: {e}"),
+                inhibit_holder: None,
+            },
         }
     }
 
@@ -869,5 +1053,354 @@ mod tests {
         assert_eq!(response.status, HelperStatus::Error);
         assert_eq!(response.server_ready, false);
         assert!(response.message.contains("did not become ready"));
+    }
+
+    // ============= Lease tests =============
+
+    #[test]
+    fn lease_acquire_response_serializes_to_json() {
+        let response = LeaseAcquireResponse {
+            status: HelperStatus::Ok,
+            message: "lease renewed".to_string(),
+            inhibit_holder: Some(UnitInfo {
+                unit_name: "llm-wake-proxy-inhibit".to_string(),
+                active_state: "active".to_string(),
+                sub_state: "running".to_string(),
+                description: "llm-wake-proxy inhibit holder".to_string(),
+            }),
+            ttl_secs: 900,
+            renewed: true,
+        };
+
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["ttl_secs"], 900);
+        assert_eq!(json["renewed"], true);
+        assert_eq!(json["inhibit_holder"]["active_state"], "active");
+    }
+
+    #[test]
+    fn lease_acquire_response_with_error() {
+        let response = LeaseAcquireResponse {
+            status: HelperStatus::Error,
+            message: "failed to acquire lease: systemd-run not found".to_string(),
+            inhibit_holder: None,
+            ttl_secs: 900,
+            renewed: false,
+        };
+
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["status"], "error");
+        assert_eq!(json["inhibit_holder"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn lease_release_response_serializes_to_json() {
+        let response = LeaseReleaseResponse {
+            status: HelperStatus::Ok,
+            message: "lease released".to_string(),
+            inhibit_holder: Some(UnitInfo {
+                unit_name: "llm-wake-proxy-inhibit".to_string(),
+                active_state: "inactive".to_string(),
+                sub_state: "dead".to_string(),
+                description: String::new(),
+            }),
+        };
+
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["inhibit_holder"]["active_state"], "inactive");
+    }
+
+    #[test]
+    fn lease_release_response_with_error() {
+        let response = LeaseReleaseResponse {
+            status: HelperStatus::Error,
+            message: "failed to release lease: unit not found".to_string(),
+            inhibit_holder: None,
+        };
+
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["status"], "error");
+        assert_eq!(json["inhibit_holder"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn lease_inspect_response_serializes_to_json() {
+        let response = LeaseInspectResponse {
+            status: HelperStatus::Ok,
+            message: "current lease state".to_string(),
+            inhibit_holder: Some(UnitInfo {
+                unit_name: "llm-wake-proxy-inhibit".to_string(),
+                active_state: "active".to_string(),
+                sub_state: "running".to_string(),
+                description: "llm-wake-proxy inhibit holder".to_string(),
+            }),
+        };
+
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["inhibit_holder"]["active_state"], "active");
+    }
+
+    #[test]
+    fn lease_acquire_creates_transient_unit() {
+        let config = HelperConfig::default();
+
+        struct LeaseSystemd;
+
+        impl SystemdControl for LeaseSystemd {
+            fn show_unit(&self, unit: &str) -> Result<HashMap<String, String>, String> {
+                let mut map = HashMap::new();
+                map.insert("ActiveState".to_string(), "active".to_string());
+                map.insert("SubState".to_string(), "running".to_string());
+                map.insert("Description".to_string(), format!("{unit} unit"));
+                Ok(map)
+            }
+            fn is_active(&self, _unit: &str) -> Result<bool, String> {
+                Ok(false)
+            }
+            fn start_unit(&self, _unit: &str) -> Result<(), String> {
+                Ok(())
+            }
+            fn replace_transient_unit(
+                &self,
+                _unit: &str,
+                _description: &str,
+                _args: &[&str],
+            ) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        impl ServerCheck for LeaseSystemd {
+            fn get_text(&self, _url: &str) -> Result<String, String> {
+                Ok(String::new())
+            }
+        }
+
+        let helper = Helper::with_services(config, Box::new(LeaseSystemd), Box::new(LeaseSystemd));
+        let response = helper.lease_acquire(900);
+
+        assert_eq!(response.status, HelperStatus::Ok);
+        assert_eq!(response.message, "lease acquired");
+        assert_eq!(response.ttl_secs, 900);
+        assert_eq!(response.renewed, false);
+    }
+
+    #[test]
+    fn lease_acquire_renews_existing_lease() {
+        let config = HelperConfig::default();
+
+        struct RenewLeaseSystemd;
+
+        impl SystemdControl for RenewLeaseSystemd {
+            fn show_unit(&self, unit: &str) -> Result<HashMap<String, String>, String> {
+                let mut map = HashMap::new();
+                map.insert("ActiveState".to_string(), "active".to_string());
+                map.insert("SubState".to_string(), "running".to_string());
+                map.insert("Description".to_string(), format!("{unit} unit"));
+                Ok(map)
+            }
+            fn is_active(&self, _unit: &str) -> Result<bool, String> {
+                Ok(true)
+            }
+            fn start_unit(&self, _unit: &str) -> Result<(), String> {
+                Ok(())
+            }
+            fn replace_transient_unit(
+                &self,
+                _unit: &str,
+                _description: &str,
+                _args: &[&str],
+            ) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        impl ServerCheck for RenewLeaseSystemd {
+            fn get_text(&self, _url: &str) -> Result<String, String> {
+                Ok(String::new())
+            }
+        }
+
+        let helper = Helper::with_services(
+            config,
+            Box::new(RenewLeaseSystemd),
+            Box::new(RenewLeaseSystemd),
+        );
+        let response = helper.lease_acquire(600);
+
+        assert_eq!(response.status, HelperStatus::Ok);
+        assert_eq!(response.message, "lease renewed");
+        assert_eq!(response.renewed, true);
+    }
+
+    #[test]
+    fn lease_acquire_reports_failure() {
+        let config = HelperConfig::default();
+
+        struct FailingLeaseSystemd;
+
+        impl SystemdControl for FailingLeaseSystemd {
+            fn show_unit(&self, unit: &str) -> Result<HashMap<String, String>, String> {
+                let mut map = HashMap::new();
+                map.insert("ActiveState".to_string(), "inactive".to_string());
+                map.insert("SubState".to_string(), "dead".to_string());
+                map.insert("Description".to_string(), format!("{unit} unit"));
+                Ok(map)
+            }
+            fn is_active(&self, _unit: &str) -> Result<bool, String> {
+                Ok(false)
+            }
+            fn start_unit(&self, _unit: &str) -> Result<(), String> {
+                Ok(())
+            }
+            fn replace_transient_unit(
+                &self,
+                _unit: &str,
+                _description: &str,
+                _args: &[&str],
+            ) -> Result<(), String> {
+                Err("systemd-run binary not found".to_string())
+            }
+        }
+
+        impl ServerCheck for FailingLeaseSystemd {
+            fn get_text(&self, _url: &str) -> Result<String, String> {
+                Ok(String::new())
+            }
+        }
+
+        let helper = Helper::with_services(
+            config,
+            Box::new(FailingLeaseSystemd),
+            Box::new(FailingLeaseSystemd),
+        );
+        let response = helper.lease_acquire(900);
+
+        assert_eq!(response.status, HelperStatus::Error);
+        assert!(response.message.contains("systemd-run"));
+        assert_eq!(response.renewed, false);
+    }
+
+    #[test]
+    fn lease_release_stops_inhibit_unit() {
+        let config = HelperConfig::default();
+
+        struct StoppableSystemd;
+
+        impl SystemdControl for StoppableSystemd {
+            fn show_unit(&self, unit: &str) -> Result<HashMap<String, String>, String> {
+                let mut map = HashMap::new();
+                map.insert("ActiveState".to_string(), "inactive".to_string());
+                map.insert("SubState".to_string(), "dead".to_string());
+                map.insert("Description".to_string(), format!("{unit} unit"));
+                Ok(map)
+            }
+            fn is_active(&self, _unit: &str) -> Result<bool, String> {
+                Ok(false)
+            }
+            fn start_unit(&self, _unit: &str) -> Result<(), String> {
+                Ok(())
+            }
+            fn stop_unit(&self, _unit: &str) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        impl ServerCheck for StoppableSystemd {
+            fn get_text(&self, _url: &str) -> Result<String, String> {
+                Ok(String::new())
+            }
+        }
+
+        let helper = Helper::with_services(
+            config,
+            Box::new(StoppableSystemd),
+            Box::new(StoppableSystemd),
+        );
+        let response = helper.lease_release();
+
+        assert_eq!(response.status, HelperStatus::Ok);
+        assert_eq!(response.message, "lease released");
+    }
+
+    #[test]
+    fn lease_release_reports_failure() {
+        let config = HelperConfig::default();
+
+        struct UnstoppableSystemd;
+
+        impl SystemdControl for UnstoppableSystemd {
+            fn show_unit(&self, _unit: &str) -> Result<HashMap<String, String>, String> {
+                Err("unit not found".to_string())
+            }
+            fn is_active(&self, _unit: &str) -> Result<bool, String> {
+                Ok(false)
+            }
+            fn start_unit(&self, _unit: &str) -> Result<(), String> {
+                Ok(())
+            }
+            fn stop_unit(&self, _unit: &str) -> Result<(), String> {
+                Err("unit not found".to_string())
+            }
+        }
+
+        impl ServerCheck for UnstoppableSystemd {
+            fn get_text(&self, _url: &str) -> Result<String, String> {
+                Ok(String::new())
+            }
+        }
+
+        let helper = Helper::with_services(
+            config,
+            Box::new(UnstoppableSystemd),
+            Box::new(UnstoppableSystemd),
+        );
+        let response = helper.lease_release();
+
+        assert_eq!(response.status, HelperStatus::Error);
+        assert!(response.message.contains("unit not found"));
+    }
+
+    #[test]
+    fn lease_inspect_returns_current_state() {
+        let config = HelperConfig::default();
+
+        struct InspectableSystemd;
+
+        impl SystemdControl for InspectableSystemd {
+            fn show_unit(&self, unit: &str) -> Result<HashMap<String, String>, String> {
+                let mut map = HashMap::new();
+                map.insert("ActiveState".to_string(), "active".to_string());
+                map.insert("SubState".to_string(), "running".to_string());
+                map.insert("Description".to_string(), format!("{unit} unit"));
+                Ok(map)
+            }
+            fn is_active(&self, _unit: &str) -> Result<bool, String> {
+                Ok(true)
+            }
+            fn start_unit(&self, _unit: &str) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        impl ServerCheck for InspectableSystemd {
+            fn get_text(&self, _url: &str) -> Result<String, String> {
+                Ok(String::new())
+            }
+        }
+
+        let helper = Helper::with_services(
+            config,
+            Box::new(InspectableSystemd),
+            Box::new(InspectableSystemd),
+        );
+        let response = helper.lease_inspect();
+
+        assert_eq!(response.status, HelperStatus::Ok);
+        let unit = response.inhibit_holder.unwrap();
+        assert_eq!(unit.active_state, "active");
     }
 }
