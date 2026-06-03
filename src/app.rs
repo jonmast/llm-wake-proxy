@@ -7,12 +7,12 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
     forward::{self, ForwardConfig},
-    lifecycle::{BackendStatus, CapabilityState, LifecycleDecision, LifecycleRequest},
+    lifecycle::{CapabilityState, LifecycleDecision, LifecycleRequest},
     scheduler::WarmExecutionError,
     state::AppState,
 };
@@ -111,11 +111,25 @@ async fn healthz() -> impl IntoResponse {
 
 async fn status(State(state): State<AppState>) -> impl IntoResponse {
     let backend = state.lifecycle.status();
+    let metrics = state.metrics.snapshot();
 
-    Json(StatusResponse::new(
-        state.config.model.alias.clone(),
-        backend,
-    ))
+    Json(json!({
+        "state": backend.lifecycle,
+        "model_alias": state.config.model.alias,
+        "capabilities": {
+            "chat": backend.chat,
+            "embeddings": backend.embeddings,
+            "embeddings_reason": backend.embeddings_reason,
+        },
+        "tunnel": backend.tunnel,
+        "last_wake_attempt_at": backend.last_wake_attempt_at,
+        "lease_expires_at": backend.lease_expires_at,
+        "host_unit": {
+            "llama_server_unit": backend.llama_server_unit,
+            "inhibit_unit": backend.inhibit_unit,
+        },
+        "metrics": metrics,
+    }))
 }
 
 async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
@@ -139,6 +153,8 @@ async fn chat_completions(
     _: OptionalAuthorization,
     raw_body: axum::body::Bytes,
 ) -> Response {
+    state.metrics.inc_chat_requests();
+
     let payload: ChatCompletionRequest = match serde_json::from_slice(&raw_body) {
         Ok(v) => v,
         Err(e) => {
@@ -199,6 +215,7 @@ async fn embeddings(
     _: OptionalAuthorization,
     raw_body: axum::body::Bytes,
 ) -> Response {
+    state.metrics.inc_embeddings_requests();
     let payload: EmbeddingsRequest = match serde_json::from_slice(&raw_body) {
         Ok(v) => v,
         Err(e) => {
@@ -295,13 +312,40 @@ async fn inference_response(
             {
                 Ok(Ok(response)) => response,
                 Ok(Err(forward::ForwardError::EmbeddingsUnsupported)) => {
+                    state.metrics.inc_embeddings_degraded();
                     embedding_degradation_response(&state, "upstream returned 404").await
                 }
-                Ok(Err(error)) => error.to_openai(),
-                Err(error) => warm_execution_error_response(error),
+                Ok(Err(error)) => {
+                    state.metrics.inc_forwarding_errors();
+                    error.to_openai()
+                }
+                Err(WarmExecutionError::QueueFull) => {
+                    state.metrics.inc_queue_full();
+                    warm_execution_error_response(WarmExecutionError::QueueFull)
+                }
+                Err(WarmExecutionError::QueueTimeout) => {
+                    state.metrics.inc_queue_timeouts();
+                    warm_execution_error_response(WarmExecutionError::QueueTimeout)
+                }
             }
         }
-        decision => lifecycle_response(decision),
+        LifecycleDecision::Warming {
+            retry_after_secs, ..
+        } => {
+            state.metrics.inc_cold_starts();
+            openai_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "warming_up",
+                "backend is still starting".to_string(),
+                Some(&retry_after_secs.to_string()),
+            )
+        }
+        LifecycleDecision::Failed { error, .. } => openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "backend_error",
+            error.message,
+            None,
+        ),
     }
 }
 
@@ -316,31 +360,6 @@ async fn embedding_degradation_response(state: &AppState, reason: &str) -> Respo
         format!("upstream backend does not support embeddings: {reason}"),
         None,
     )
-}
-
-fn lifecycle_response(decision: LifecycleDecision) -> Response {
-    match decision {
-        LifecycleDecision::Ready(_) => openai_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "backend_unavailable",
-            "backend is ready but forwarding failed".to_string(),
-            None,
-        ),
-        LifecycleDecision::Warming {
-            retry_after_secs, ..
-        } => openai_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "warming_up",
-            "backend is still starting".to_string(),
-            Some(&retry_after_secs.to_string()),
-        ),
-        LifecycleDecision::Failed { error, .. } => openai_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "backend_error",
-            error.message,
-            None,
-        ),
-    }
 }
 
 fn warm_execution_error_response(error: WarmExecutionError) -> Response {
@@ -566,58 +585,6 @@ struct ToolCallFunction {
 struct EmbeddingsRequest {
     model: String,
     input: Value,
-}
-
-#[derive(Serialize)]
-struct StatusResponse {
-    state: crate::lifecycle::LifecycleState,
-    model_alias: String,
-    capabilities: CapabilityStatusResponse,
-    last_wake_attempt_at: Option<crate::lifecycle::Timestamp>,
-    lease_expires_at: Option<crate::lifecycle::Timestamp>,
-    tunnel: TunnelStatusResponse,
-    units: UnitStatusResponse,
-}
-
-impl StatusResponse {
-    fn new(model_alias: String, backend: BackendStatus) -> Self {
-        Self {
-            state: backend.lifecycle,
-            model_alias,
-            capabilities: CapabilityStatusResponse {
-                chat: backend.chat,
-                embeddings: backend.embeddings,
-                embeddings_reason: backend.embeddings_reason,
-            },
-            last_wake_attempt_at: backend.last_wake_attempt_at,
-            lease_expires_at: backend.lease_expires_at,
-            tunnel: TunnelStatusResponse {
-                state: backend.tunnel,
-            },
-            units: UnitStatusResponse {
-                llama_server: backend.llama_server_unit,
-                inhibit_holder: backend.inhibit_unit,
-            },
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct CapabilityStatusResponse {
-    chat: crate::lifecycle::CapabilityState,
-    embeddings: crate::lifecycle::CapabilityState,
-    embeddings_reason: Option<String>,
-}
-
-#[derive(Serialize)]
-struct TunnelStatusResponse {
-    state: crate::lifecycle::TunnelState,
-}
-
-#[derive(Serialize)]
-struct UnitStatusResponse {
-    llama_server: crate::lifecycle::UnitState,
-    inhibit_holder: crate::lifecycle::UnitState,
 }
 
 #[cfg(test)]
@@ -1349,9 +1316,9 @@ mod tests {
         assert_eq!(json["state"], "ready");
         assert_eq!(json["capabilities"]["chat"], "degraded");
         assert_eq!(json["capabilities"]["embeddings_reason"], "remote disabled");
-        assert_eq!(json["tunnel"]["state"], "ready");
-        assert_eq!(json["units"]["llama_server"], "active");
-        assert_eq!(json["units"]["inhibit_holder"], "activating");
+        assert_eq!(json["tunnel"], "ready");
+        assert_eq!(json["host_unit"]["llama_server_unit"], "active");
+        assert_eq!(json["host_unit"]["inhibit_unit"], "activating");
         assert_eq!(json["last_wake_attempt_at"], 1717156800u64);
         assert_eq!(json["lease_expires_at"], 1717158600u64);
     }
@@ -1382,7 +1349,7 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["state"], "warming");
-        assert_eq!(json["tunnel"]["state"], "connecting");
+        assert_eq!(json["tunnel"], "connecting");
     }
 
     #[tokio::test]

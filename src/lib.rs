@@ -4,5 +4,6 @@ pub mod forward;
 pub mod helper;
 pub mod host;
 pub mod lifecycle;
+pub mod metrics;
 pub mod scheduler;
 pub mod state;

@@ -12,6 +12,7 @@ use crate::{
         ObservedBackendState, SshReadinessProbe, Timestamp, TunnelOwner, TunnelState,
         WakeRequester,
     },
+    metrics::Metrics,
     scheduler::WarmExecutionScheduler,
 };
 
@@ -21,6 +22,7 @@ pub struct AppState {
     pub backend: Arc<RwLock<BackendStatus>>,
     pub lifecycle: Arc<dyn LifecycleOrchestrator>,
     pub scheduler: WarmExecutionScheduler,
+    pub metrics: Arc<Metrics>,
 }
 
 impl AppState {
@@ -41,6 +43,7 @@ impl AppState {
             backend,
             lifecycle,
             scheduler,
+            metrics: Arc::new(Metrics::default()),
         }
     }
 
@@ -82,6 +85,7 @@ impl AppState {
             backend,
             lifecycle,
             scheduler,
+            metrics: Arc::new(Metrics::default()),
         }
     }
 
@@ -108,6 +112,7 @@ impl AppState {
             backend,
             lifecycle,
             scheduler,
+            metrics: Arc::new(Metrics::default()),
         }
     }
 }

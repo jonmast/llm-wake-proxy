@@ -5,6 +5,7 @@ use tokio::{
     sync::{Mutex, watch},
     time::Instant,
 };
+use tracing::{debug, info, warn};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
@@ -72,6 +73,12 @@ impl LifecycleError {
         Self {
             message: message.into(),
         }
+    }
+}
+
+impl std::fmt::Display for LifecycleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
     }
 }
 
@@ -307,8 +314,12 @@ where
         mut status: BackendStatus,
     ) -> LifecycleDecision {
         let ssh_ready = match self.ssh.is_ready().await {
-            Ok(ready) => ready,
+            Ok(ready) => {
+                debug!(ssh_ready = ready, "SSH readiness probe completed");
+                ready
+            }
             Err(error) => {
+                warn!(error = %error, "SSH readiness probe failed");
                 status.lifecycle = LifecycleState::Error;
                 status.tunnel = TunnelState::Down;
                 return LifecycleDecision::Failed { status, error };
@@ -319,10 +330,12 @@ where
             if let Some(wake_request) =
                 wake_request.filter(|_| should_request_wake(status.lifecycle))
             {
+                info!(request = ?wake_request, "sending wake request");
                 status.last_wake_attempt_at = Some(self.clock.now());
                 status.tunnel = TunnelState::Down;
 
                 if let Err(error) = self.wake.request_wake(wake_request).await {
+                    warn!(error = %error, "wake request failed");
                     status.lifecycle = LifecycleState::Error;
                     return LifecycleDecision::Failed { status, error };
                 }
@@ -338,8 +351,17 @@ where
         }
 
         let observed = match self.helper.observe_backend(&observe_request).await {
-            Ok(observed) => observed,
+            Ok(observed) => {
+                debug!(
+                    lifecycle = ?observed.lifecycle,
+                    chat = ?observed.chat,
+                    embeddings = ?observed.embeddings,
+                    "backend observation completed"
+                );
+                observed
+            }
             Err(error) => {
+                warn!(error = %error, "backend observation failed");
                 status.lifecycle = LifecycleState::Error;
                 status.tunnel = TunnelState::Down;
                 return LifecycleDecision::Failed { status, error };
@@ -373,8 +395,12 @@ where
         }
 
         status.tunnel = match self.tunnel.ensure_tunnel().await {
-            Ok(tunnel_state) => tunnel_state,
+            Ok(tunnel_state) => {
+                debug!(tunnel = ?tunnel_state, "tunnel check completed");
+                tunnel_state
+            }
             Err(error) => {
+                warn!(error = %error, "tunnel ensure failed");
                 status.lifecycle = LifecycleState::Error;
                 status.tunnel = TunnelState::Down;
                 return LifecycleDecision::Failed { status, error };

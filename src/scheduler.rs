@@ -4,6 +4,7 @@ use std::sync::{
 };
 
 use tokio::sync::{Notify, Semaphore, TryAcquireError};
+use tracing::{debug, warn};
 
 use crate::{config::WarmExecutionConfig, lifecycle::LifecycleRequest};
 
@@ -114,7 +115,10 @@ impl WarmExecutionScheduler {
                 match permit {
                     Ok(Ok(permit)) => permit,
                     Ok(Err(_)) => panic!("warm execution semaphore should remain open"),
-                    Err(_) => return Err(WarmExecutionError::QueueTimeout),
+                    Err(_) => {
+                        warn!("warm execution queue timeout");
+                        return Err(WarmExecutionError::QueueTimeout);
+                    }
                 }
             }
             Err(TryAcquireError::Closed) => {
@@ -124,6 +128,7 @@ impl WarmExecutionScheduler {
 
         let cancellation = RequestCancellation::new();
         let cancel_on_drop = CancelOnDrop::new(cancellation.clone());
+        debug!("warm execution slot acquired, starting operation");
         let output = operation(cancellation).await;
         cancel_on_drop.disarm();
         drop(permit);
@@ -144,6 +149,7 @@ impl QueueTicket {
     ) -> Result<Self, WarmExecutionError> {
         let mut state = queue_state.lock().expect("queue state lock poisoned");
         if state.queued >= max_queued_requests {
+            warn!(queued = state.queued, max = max_queued_requests, "warm execution queue full");
             return Err(WarmExecutionError::QueueFull);
         }
 

@@ -4,6 +4,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde_json::{Value, json};
+use tracing::warn;
 
 use crate::scheduler::RequestCancellation;
 
@@ -98,6 +99,11 @@ pub async fn forward_non_streaming(
         if status == StatusCode::NOT_FOUND && path.starts_with("/v1/embeddings") {
             return Err(ForwardError::EmbeddingsUnsupported);
         }
+        warn!(
+            upstream_status = status.as_u16(),
+            path = path,
+            "upstream backend returned error"
+        );
         return Err(ForwardError::UpstreamError(status.as_u16(), response_body));
     }
 
