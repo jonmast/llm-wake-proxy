@@ -162,6 +162,7 @@ pub trait BackendStatePublisher: Send + Sync {
 pub trait LifecycleOrchestrator: Send + Sync {
     fn ensure_backend(&self, request: LifecycleRequest) -> LifecycleFuture<'_, LifecycleDecision>;
     fn status(&self) -> BackendStatus;
+    fn degrade_embeddings(&self, reason: String) -> LifecycleFuture<'_, ()>;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -315,7 +316,9 @@ where
         };
 
         if !ssh_ready {
-            if let Some(wake_request) = wake_request.filter(|_| should_request_wake(status.lifecycle)) {
+            if let Some(wake_request) =
+                wake_request.filter(|_| should_request_wake(status.lifecycle))
+            {
                 status.last_wake_attempt_at = Some(self.clock.now());
                 status.tunnel = TunnelState::Down;
 
@@ -475,14 +478,16 @@ where
                 let bootstrap = self.bootstrap.lock().await;
                 (bootstrap.active, bootstrap.last_error.clone())
             };
-            let stale_bootstrap_view = bootstrap_active && !matches!(status.lifecycle, LifecycleState::Warming);
+            let stale_bootstrap_view =
+                bootstrap_active && !matches!(status.lifecycle, LifecycleState::Warming);
 
             if !stale_bootstrap_view && backend_is_ready(&status) {
                 return LifecycleDecision::Ready(status);
             }
 
             if !stale_bootstrap_view && matches!(status.lifecycle, LifecycleState::Error) {
-                let error = last_error.unwrap_or_else(|| LifecycleError::new("backend reported error state"));
+                let error = last_error
+                    .unwrap_or_else(|| LifecycleError::new("backend reported error state"));
                 return LifecycleDecision::Failed { status, error };
             }
 
@@ -550,11 +555,15 @@ where
                     .await
                 {
                     ready @ LifecycleDecision::Ready(_) => {
-                        self.core.finish_bootstrap(self.core.state.snapshot(), None).await;
+                        self.core
+                            .finish_bootstrap(self.core.state.snapshot(), None)
+                            .await;
                         return ready;
                     }
                     LifecycleDecision::Failed { status, error } => {
-                        self.core.finish_bootstrap(status.clone(), Some(error.clone())).await;
+                        self.core
+                            .finish_bootstrap(status.clone(), Some(error.clone()))
+                            .await;
                         return LifecycleDecision::Failed { status, error };
                     }
                     LifecycleDecision::Warming { .. } => {
@@ -573,6 +582,15 @@ where
     fn status(&self) -> BackendStatus {
         self.core.state.snapshot()
     }
+
+    fn degrade_embeddings(&self, reason: String) -> LifecycleFuture<'_, ()> {
+        Box::pin(async move {
+            let mut status = self.core.state.snapshot();
+            status.embeddings = CapabilityState::Degraded;
+            status.embeddings_reason = Some(reason);
+            self.core.publish(status);
+        })
+    }
 }
 
 fn should_request_wake(lifecycle: LifecycleState) -> bool {
@@ -583,8 +601,7 @@ fn should_request_wake(lifecycle: LifecycleState) -> bool {
 }
 
 fn backend_is_ready(status: &BackendStatus) -> bool {
-    matches!(status.lifecycle, LifecycleState::Ready)
-        && matches!(status.tunnel, TunnelState::Ready)
+    matches!(status.lifecycle, LifecycleState::Ready) && matches!(status.tunnel, TunnelState::Ready)
 }
 
 fn request_priority(request: &LifecycleRequest) -> u8 {

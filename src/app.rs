@@ -1,4 +1,4 @@
-use axum::extract::{FromRequest, FromRequestParts, rejection::JsonRejection};
+use axum::extract::FromRequestParts;
 use axum::{
     Json, Router,
     extract::State,
@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    lifecycle::{BackendStatus, LifecycleDecision, LifecycleRequest},
+    forward::{self, ForwardConfig},
+    lifecycle::{BackendStatus, CapabilityState, LifecycleDecision, LifecycleRequest},
     scheduler::WarmExecutionError,
     state::AppState,
 };
@@ -40,21 +41,68 @@ where
     }
 }
 
-struct OpenAiJson<T>(T);
+struct RequireJsonContentType;
 
-impl<S, T> FromRequest<S> for OpenAiJson<T>
+impl<S> FromRequestParts<S> for RequireJsonContentType
 where
     S: Send + Sync,
-    Json<T>: FromRequest<S, Rejection = JsonRejection>,
 {
     type Rejection = Response;
 
-    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
-        match Json::<T>::from_request(req, state).await {
-            Ok(Json(value)) => Ok(Self(value)),
-            Err(rejection) => Err(json_rejection_to_response(rejection)),
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let has_json = parts
+            .headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| ct.contains("application/json"));
+
+        if has_json {
+            Ok(Self)
+        } else {
+            Err(openai_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "content-type must be application/json".to_string(),
+                None,
+            ))
         }
     }
+}
+
+fn normalize_json_error(err: serde_json::Error) -> String {
+    let msg = err.to_string();
+
+    if let Some(field) = extract_quoted_value(&msg, "unknown field `") {
+        return format!("unsupported field '{field}'");
+    }
+
+    if msg.contains("unknown variant") {
+        return "request body contains invalid fields".to_string();
+    }
+
+    if msg.contains("missing field `tool_call_id`") {
+        return "tool messages must include tool_call_id".to_string();
+    }
+
+    if msg.contains("missing field `content`") {
+        return "messages must include content unless assistant tool_calls are present".to_string();
+    }
+
+    if msg.contains("invalid type") {
+        return "request body contains an invalid field type".to_string();
+    }
+
+    if msg.contains("data did not match any variant of untagged enum") {
+        return "request body contains invalid fields".to_string();
+    }
+
+    "request body contains invalid fields".to_string()
+}
+
+fn extract_quoted_value<'a>(message: &'a str, prefix: &str) -> Option<&'a str> {
+    let suffix = &message[message.find(prefix)? + prefix.len()..];
+    let end = suffix.find('`')?;
+    Some(&suffix[..end])
 }
 
 async fn healthz() -> impl IntoResponse {
@@ -87,9 +135,22 @@ async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn chat_completions(
     State(state): State<AppState>,
+    _: RequireJsonContentType,
     _: OptionalAuthorization,
-    OpenAiJson(payload): OpenAiJson<ChatCompletionRequest>,
+    raw_body: axum::body::Bytes,
 ) -> Response {
+    let payload: ChatCompletionRequest = match serde_json::from_slice(&raw_body) {
+        Ok(v) => v,
+        Err(e) => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                normalize_json_error(e),
+                None,
+            );
+        }
+    };
+
     if payload.messages.is_empty() {
         return openai_error(
             StatusCode::BAD_REQUEST,
@@ -129,23 +190,27 @@ async fn chat_completions(
         );
     }
 
-    if payload.stream {
-        return openai_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "warming_up",
-            "streaming is not available until backend orchestration is implemented".to_string(),
-            Some("10"),
-        );
-    }
-
-    inference_response(state, LifecycleRequest::Chat).await
+    inference_response(state, LifecycleRequest::Chat, raw_body, payload.stream).await
 }
 
 async fn embeddings(
     State(state): State<AppState>,
+    _: RequireJsonContentType,
     _: OptionalAuthorization,
-    OpenAiJson(payload): OpenAiJson<EmbeddingsRequest>,
+    raw_body: axum::body::Bytes,
 ) -> Response {
+    let payload: EmbeddingsRequest = match serde_json::from_slice(&raw_body) {
+        Ok(v) => v,
+        Err(e) => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                normalize_json_error(e),
+                None,
+            );
+        }
+    };
+
     if payload.input.is_null() {
         return openai_error(
             StatusCode::BAD_REQUEST,
@@ -176,38 +241,81 @@ async fn embeddings(
         );
     }
 
-    inference_response(state, LifecycleRequest::Embeddings).await
+    inference_response(state, LifecycleRequest::Embeddings, raw_body, false).await
 }
 
-async fn inference_response(state: AppState, request: LifecycleRequest) -> Response {
-    match state.lifecycle.ensure_backend(request.clone()).await {
-        LifecycleDecision::Ready(_) => match state
-            .scheduler
-            .execute(request, |cancellation| async move {
-                tokio::select! {
-                    _ = cancellation.cancelled() => openai_error(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "request_cancelled",
-                        "request was cancelled before upstream execution completed".to_string(),
-                        None,
-                    ),
-                    response = async {
-                        openai_error(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "backend_unavailable",
-                            "backend is ready but request forwarding is not implemented yet".to_string(),
-                            None,
+async fn inference_response(
+    state: AppState,
+    request_kind: LifecycleRequest,
+    body_bytes: axum::body::Bytes,
+    stream: bool,
+) -> Response {
+    let config = ForwardConfig {
+        port: state.config.host.tunnel_local_port,
+    };
+    let model_alias = state.config.model.alias.clone();
+
+    match state.lifecycle.ensure_backend(request_kind.clone()).await {
+        LifecycleDecision::Ready(status) => {
+            if request_kind == LifecycleRequest::Embeddings
+                && status.embeddings == CapabilityState::Degraded
+            {
+                return openai_error(
+                    StatusCode::BAD_REQUEST,
+                    "unsupported_embeddings",
+                    status
+                        .embeddings_reason
+                        .unwrap_or_else(|| "embeddings are degraded".to_string()),
+                    None,
+                );
+            }
+
+            let path = match request_kind {
+                LifecycleRequest::Chat => "/v1/chat/completions",
+                LifecycleRequest::Embeddings => "/v1/embeddings",
+            };
+
+            match state
+                .scheduler
+                .execute(request_kind, |cancellation| async move {
+                    if stream {
+                        forward::forward_streaming(&config, path, body_bytes, &cancellation).await
+                    } else {
+                        forward::forward_non_streaming(
+                            &config,
+                            path,
+                            body_bytes,
+                            &cancellation,
+                            &model_alias,
                         )
-                    } => response,
+                        .await
+                    }
+                })
+                .await
+            {
+                Ok(Ok(response)) => response,
+                Ok(Err(forward::ForwardError::EmbeddingsUnsupported)) => {
+                    embedding_degradation_response(&state, "upstream returned 404").await
                 }
-            })
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => warm_execution_error_response(error),
-        },
+                Ok(Err(error)) => error.to_openai(),
+                Err(error) => warm_execution_error_response(error),
+            }
+        }
         decision => lifecycle_response(decision),
     }
+}
+
+async fn embedding_degradation_response(state: &AppState, reason: &str) -> Response {
+    state
+        .lifecycle
+        .degrade_embeddings(reason.to_string())
+        .await;
+    openai_error(
+        StatusCode::BAD_REQUEST,
+        "unsupported_embeddings",
+        format!("upstream backend does not support embeddings: {reason}"),
+        None,
+    )
 }
 
 fn lifecycle_response(decision: LifecycleDecision) -> Response {
@@ -215,7 +323,7 @@ fn lifecycle_response(decision: LifecycleDecision) -> Response {
         LifecycleDecision::Ready(_) => openai_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "backend_unavailable",
-            "backend is ready but request forwarding is not implemented yet".to_string(),
+            "backend is ready but forwarding failed".to_string(),
             None,
         ),
         LifecycleDecision::Warming {
@@ -223,7 +331,7 @@ fn lifecycle_response(decision: LifecycleDecision) -> Response {
         } => openai_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "warming_up",
-            "backend wake and forwarding are not implemented yet".to_string(),
+            "backend is still starting".to_string(),
             Some(&retry_after_secs.to_string()),
         ),
         LifecycleDecision::Failed { error, .. } => openai_error(
@@ -271,56 +379,6 @@ fn openai_error(
     }
 
     response
-}
-
-fn json_rejection_to_response(rejection: JsonRejection) -> Response {
-    let message = match rejection {
-        JsonRejection::MissingJsonContentType(_) => {
-            "content-type must be application/json".to_string()
-        }
-        JsonRejection::JsonSyntaxError(_) | JsonRejection::BytesRejection(_) => {
-            "request body must contain valid JSON".to_string()
-        }
-        JsonRejection::JsonDataError(err) => normalize_json_data_error(err.body_text()),
-        _ => "request body could not be parsed".to_string(),
-    };
-
-    openai_error(
-        StatusCode::BAD_REQUEST,
-        "invalid_request_error",
-        message,
-        None,
-    )
-}
-
-fn normalize_json_data_error(message: String) -> String {
-    if let Some(field) = extract_quoted_value(&message, "unknown field `") {
-        return format!("unsupported field '{field}'");
-    }
-
-    if message.contains("unknown variant") {
-        return "request body contains invalid fields".to_string();
-    }
-
-    if message.contains("missing field `tool_call_id`") {
-        return "tool messages must include tool_call_id".to_string();
-    }
-
-    if message.contains("missing field `content`") {
-        return "messages must include content unless assistant tool_calls are present".to_string();
-    }
-
-    if message.contains("invalid type") {
-        return "request body contains an invalid field type".to_string();
-    }
-
-    "request body contains invalid fields".to_string()
-}
-
-fn extract_quoted_value<'a>(message: &'a str, prefix: &str) -> Option<&'a str> {
-    let suffix = &message[message.find(prefix)? + prefix.len()..];
-    let end = suffix.find('`')?;
-    Some(&suffix[..end])
 }
 
 #[derive(Debug, Deserialize)]
@@ -604,6 +662,13 @@ mod tests {
                 LifecycleDecision::Warming { status, .. } => status.clone(),
                 LifecycleDecision::Failed { status, .. } => status.clone(),
             }
+        }
+
+        fn degrade_embeddings(
+            &self,
+            _reason: String,
+        ) -> crate::lifecycle::LifecycleFuture<'_, ()> {
+            Box::pin(async move {})
         }
     }
 
