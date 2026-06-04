@@ -183,12 +183,19 @@ pub struct LifecycleTiming {
 impl Default for LifecycleTiming {
     fn default() -> Self {
         Self {
-            cold_wait_budget_secs: 90,
-            hard_boot_deadline_secs: 5 * 60,
-            bootstrap_poll_interval_millis: 1_000,
-            retry_after_secs: 10,
+            cold_wait_budget_secs: read_env_or("COLD_WAIT_BUDGET_SECS", 90),
+            hard_boot_deadline_secs: read_env_or("HARD_BOOT_DEADLINE_SECS", 300),
+            bootstrap_poll_interval_millis: read_env_or("BOOTSTRAP_POLL_INTERVAL_MS", 1_000),
+            retry_after_secs: read_env_or("RETRY_AFTER_SECS", 10),
         }
     }
+}
+
+fn read_env_or(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 struct BootstrapState {

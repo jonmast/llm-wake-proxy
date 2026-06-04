@@ -27,33 +27,34 @@ All configuration is via environment variables.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LISTEN_ADDR` | `0.0.0.0:8080` | Proxy listen address |
-| `MODEL_ALIAS` | `default` | Stable model name exposed to clients |
-| `MODEL_OWNED_BY` | `openai` | Owner string for `/v1/models` |
-| `MODEL_PROVIDER_ID` | `proxy` | Provider ID for `/v1/models` |
+| `PORT` | `3000` | Proxy listen port |
+| `MODEL_ALIAS` | `llm-wake-proxy` | Stable model name exposed to clients |
+| `MODEL_OWNED_BY` | `llm-wake-proxy` | Owner string for `/v1/models` |
+| `MODEL_PROVIDER_ID` | `llama.cpp` | Provider ID for `/v1/models` |
 | `EMBEDDINGS_ENABLED` | `true` | Enable embeddings forwarding |
 | `WARM_MAX_ACTIVE_REQUESTS` | `2` | Max concurrent upstream requests |
 | `WARM_MAX_QUEUED_REQUESTS` | `16` | Max queued warm requests (0 = no queue) |
 | `WARM_QUEUE_TIMEOUT_SECS` | `30` | Max seconds a request waits in queue |
+| `COLD_START_MAX_WAITING` | `32` | Max concurrent cold-start waiting requests |
 
 ### Host / SSH
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HOST` | `127.0.0.1` | Bare-metal host address (IP or Tailscale hostname) |
-| `SSH_USER` | `jon` | SSH user on the host |
+| `SSH_HOST` | (required) | Bare-metal host address (IP or Tailscale hostname) |
+| `SSH_USER` | (required) | SSH user on the host |
 | `SSH_PORT` | `22` | SSH port |
-| `HELPER_PATH` | `/home/jon/.cargo/bin/llm-wake-proxy-helper` | Path to helper binary on host |
-| `MODEL_PATH` | `/models/...` | Path to model file on host (for model verification) |
+| `HELPER_PATH` | `/usr/local/bin/helper` | Path to helper binary on host |
+| `MODEL_PATH` | (required) | Path to model file on host (for model verification) |
 | `TUNNEL_LOCAL_PORT` | `18080` | Local port for SSH tunnel |
-| `REMOTE_PORT` | `8080` | Remote port on host (llama-server) |
+| `LLAMA_SERVER_PORT` | `8080` | Remote port on host (llama-server) |
 
 ### Wake-on-LAN
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `WOL_MAC` | (required) | MAC address of host (colon-separated) |
-| `WOL_BROADCAST` | `255.255.255.255` | Broadcast address |
+| `WOL_MAC_ADDRESS` | (required) | MAC address of host (colon-separated) |
+| `WOL_BROADCAST_ADDR` | `255.255.255.255` | Broadcast address |
 | `WOL_PORT` | `9` | WOL UDP port |
 
 ## Host Setup
@@ -173,6 +174,15 @@ The `/status` endpoint includes a `metrics` object with atomic counters:
 - `forwarding_errors` - Upstream forwarding errors
 - `chat_requests` - Total chat requests received
 - `embeddings_requests` - Total embeddings requests received
+
+## Lifecycle Timing
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `COLD_WAIT_BUDGET_SECS` | `90` | How long a cold request waits before returning 503 |
+| `HARD_BOOT_DEADLINE_SECS` | `300` | Maximum time from first wake to backend ready |
+| `BOOTSTRAP_POLL_INTERVAL_MS` | `1000` | Polling interval during bootstrap |
+| `RETRY_AFTER_SECS` | `10` | Value for Retry-After header in warming responses |
 
 ## Design Constraints
 

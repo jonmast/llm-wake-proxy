@@ -1,7 +1,12 @@
 use std::{
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
+
+use tokio::sync::Semaphore;
 
 use crate::{
     config::AppConfig,
@@ -23,11 +28,31 @@ pub struct AppState {
     pub lifecycle: Arc<dyn LifecycleOrchestrator>,
     pub scheduler: WarmExecutionScheduler,
     pub metrics: Arc<Metrics>,
+    prev_tunnel_was_ready: Arc<AtomicBool>,
+    pub cold_start_semaphore: Arc<Semaphore>,
+}
+
+impl AppState {
+    pub fn check_tunnel_drop(&self, current_tunnel: TunnelState) -> bool {
+        let was_ready = self.prev_tunnel_was_ready.swap(
+            matches!(current_tunnel, TunnelState::Ready),
+            Ordering::Relaxed,
+        );
+        was_ready && !matches!(current_tunnel, TunnelState::Ready)
+    }
+
+    pub fn is_cold(&self) -> bool {
+        matches!(
+            self.backend.read().expect("backend state lock poisoned").lifecycle,
+            LifecycleState::Cold
+        )
+    }
 }
 
 impl AppState {
     pub fn new(config: AppConfig) -> Self {
         let backend = Arc::new(RwLock::new(BackendStatus::default()));
+        let cold_start_max = config.cold_start_max_waiting;
         let lifecycle = Arc::new(LifecycleManager::new(
             NoopWakeRequester,
             NoopSshReadinessProbe,
@@ -44,11 +69,14 @@ impl AppState {
             lifecycle,
             scheduler,
             metrics: Arc::new(Metrics::default()),
+            prev_tunnel_was_ready: Arc::new(AtomicBool::new(false)),
+            cold_start_semaphore: Arc::new(Semaphore::new(cold_start_max)),
         }
     }
 
     pub fn production(config: AppConfig) -> Self {
         let backend = Arc::new(RwLock::new(BackendStatus::default()));
+        let cold_start_max = config.cold_start_max_waiting;
 
         let wake = WolWakeRequester::new(
             config.host.wol_mac,
@@ -86,6 +114,8 @@ impl AppState {
             lifecycle,
             scheduler,
             metrics: Arc::new(Metrics::default()),
+            prev_tunnel_was_ready: Arc::new(AtomicBool::new(false)),
+            cold_start_semaphore: Arc::new(Semaphore::new(cold_start_max)),
         }
     }
 
@@ -107,12 +137,15 @@ impl AppState {
         lifecycle: Arc<dyn LifecycleOrchestrator>,
         scheduler: WarmExecutionScheduler,
     ) -> Self {
+        let cold_start_max = config.cold_start_max_waiting;
         Self {
             config,
             backend,
             lifecycle,
             scheduler,
             metrics: Arc::new(Metrics::default()),
+            prev_tunnel_was_ready: Arc::new(AtomicBool::new(false)),
+            cold_start_semaphore: Arc::new(Semaphore::new(cold_start_max)),
         }
     }
 }

@@ -3,6 +3,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use futures_util::StreamExt;
 use serde_json::{Value, json};
 use tracing::warn;
 
@@ -122,6 +123,7 @@ pub async fn forward_streaming(
     path: &str,
     body: Bytes,
     cancellation: &RequestCancellation,
+    model_alias: &str,
 ) -> Result<Response, ForwardError> {
     let client = build_client();
     let url = format!("http://127.0.0.1:{}{path}", config.port);
@@ -142,7 +144,18 @@ pub async fn forward_streaming(
         return Err(ForwardError::UpstreamError(status.as_u16(), body));
     }
 
-    let stream = response.bytes_stream();
+    let alias = model_alias.to_string();
+    let stream = response.bytes_stream().map(move |chunk| {
+        let alias = alias.clone();
+        match chunk {
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes);
+                let rewritten = rewrite_model_alias(&text, &alias);
+                Ok::<_, reqwest::Error>(Bytes::from(rewritten.into_bytes()))
+            }
+            Err(e) => Err(e),
+        }
+    });
     let body = axum::body::Body::from_stream(stream);
 
     Ok((

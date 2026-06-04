@@ -7,6 +7,7 @@ pub struct AppConfig {
     pub embeddings: EmbeddingsConfig,
     pub warm_execution: WarmExecutionConfig,
     pub host: HostConfig,
+    pub cold_start_max_waiting: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -105,6 +106,7 @@ impl AppConfig {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(8080),
             },
+            cold_start_max_waiting: read_positive_usize("COLD_START_MAX_WAITING", 32),
         }
     }
 }

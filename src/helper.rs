@@ -281,11 +281,11 @@ impl Helper {
         let active_model = if self.is_server_alive() {
             match self.check_model_identity() {
                 Ok(reported_id) => Some(ModelInfo {
-                    model_alias: String::new(),
-                    model_path: String::new(),
+                    model_alias: reported_id.as_deref().unwrap_or_default().to_string(),
+                    model_path: reported_id.unwrap_or_default(),
                     serving: true,
                     ready: true,
-                    reported_id,
+                    reported_id: None,
                 }),
                 Err(_) => Some(ModelInfo {
                     model_alias: String::new(),

@@ -272,8 +272,28 @@ async fn inference_response(
     };
     let model_alias = state.config.model.alias.clone();
 
+    let _cold_permit = if state.is_cold() {
+        match state.cold_start_semaphore.clone().try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                return openai_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "warming_up",
+                    "cold-start queue is full, retry later".to_string(),
+                    Some("10"),
+                );
+            }
+        }
+    } else {
+        None
+    };
+
     match state.lifecycle.ensure_backend(request_kind.clone()).await {
         LifecycleDecision::Ready(status) => {
+            if state.check_tunnel_drop(status.tunnel) {
+                state.metrics.inc_tunnel_drops();
+            }
+
             if request_kind == LifecycleRequest::Embeddings
                 && status.embeddings == CapabilityState::Degraded
             {
@@ -296,7 +316,14 @@ async fn inference_response(
                 .scheduler
                 .execute(request_kind, |cancellation| async move {
                     if stream {
-                        forward::forward_streaming(&config, path, body_bytes, &cancellation).await
+                        forward::forward_streaming(
+                            &config,
+                            path,
+                            body_bytes,
+                            &cancellation,
+                            &model_alias,
+                        )
+                        .await
                     } else {
                         forward::forward_non_streaming(
                             &config,
@@ -310,7 +337,10 @@ async fn inference_response(
                 })
                 .await
             {
-                Ok(Ok(response)) => response,
+                Ok(Ok(response)) => {
+                    state.metrics.inc_warm_requests();
+                    response
+                }
                 Ok(Err(forward::ForwardError::EmbeddingsUnsupported)) => {
                     state.metrics.inc_embeddings_degraded();
                     embedding_degradation_response(&state, "upstream returned 404").await
@@ -333,6 +363,7 @@ async fn inference_response(
             retry_after_secs, ..
         } => {
             state.metrics.inc_cold_starts();
+            state.metrics.inc_wake_attempts();
             openai_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "warming_up",
@@ -340,12 +371,15 @@ async fn inference_response(
                 Some(&retry_after_secs.to_string()),
             )
         }
-        LifecycleDecision::Failed { error, .. } => openai_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "backend_error",
-            error.message,
-            None,
-        ),
+        LifecycleDecision::Failed { error, .. } => {
+            state.metrics.inc_wake_failures();
+            openai_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "backend_error",
+                error.message,
+                None,
+            )
+        }
     }
 }
 
@@ -652,6 +686,7 @@ mod tests {
             embeddings: EmbeddingsConfig { enabled: true },
             warm_execution: WarmExecutionConfig::default(),
             host: HostConfig::default(),
+            cold_start_max_waiting: 32,
         }
     }
 
@@ -1132,6 +1167,7 @@ mod tests {
             embeddings: EmbeddingsConfig { enabled: false },
             warm_execution: WarmExecutionConfig::default(),
             host: HostConfig::default(),
+            cold_start_max_waiting: 32,
         });
         let app = build_router(state);
 
