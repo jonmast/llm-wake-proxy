@@ -298,6 +298,7 @@ impl SshTunnelManager {
 
     async fn create_tunnel(&self) -> Result<Child, LifecycleError> {
         let mut child = tokio::process::Command::new("ssh")
+            .kill_on_drop(true)
             .args([
                 "-o",
                 "ConnectTimeout=10",

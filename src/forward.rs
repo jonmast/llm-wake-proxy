@@ -171,18 +171,64 @@ fn rewrite_model_alias(body: &str, alias: &str) -> String {
         return body.to_string();
     }
 
-    match serde_json::from_str::<Value>(body) {
-        Ok(mut value) => {
-            if let Some(obj) = value.as_object_mut() {
-                if let Some(model) = obj.get_mut("model") {
-                    *model = Value::String(alias.to_string());
+    let mut parts = Vec::new();
+    for part in body.split('\n') {
+        let (clean_part, has_r) = if part.ends_with('\r') {
+            (&part[..part.len() - 1], true)
+        } else {
+            (part, false)
+        };
+
+        let processed = if let Some(sse_data) = clean_part.strip_prefix("data: ") {
+            if sse_data.contains("\"model\"") {
+                match serde_json::from_str::<Value>(sse_data) {
+                    Ok(mut value) => {
+                        if let Some(obj) = value.as_object_mut() {
+                            if let Some(model) = obj.get_mut("model") {
+                                *model = Value::String(alias.to_string());
+                            }
+                        }
+                        if let Ok(rewritten) = serde_json::to_string(&value) {
+                            format!("data: {rewritten}")
+                        } else {
+                            clean_part.to_string()
+                        }
+                    }
+                    Err(_) => clean_part.to_string(),
                 }
+            } else {
+                clean_part.to_string()
             }
-            serde_json::to_string(&value).unwrap_or_else(|_| body.to_string())
+        } else if clean_part.contains("\"model\"") {
+            match serde_json::from_str::<Value>(clean_part) {
+                Ok(mut value) => {
+                    if let Some(obj) = value.as_object_mut() {
+                        if let Some(model) = obj.get_mut("model") {
+                            *model = Value::String(alias.to_string());
+                        }
+                    }
+                    if let Ok(rewritten) = serde_json::to_string(&value) {
+                        rewritten
+                    } else {
+                        clean_part.to_string()
+                    }
+                }
+                Err(_) => clean_part.to_string(),
+            }
+        } else {
+            clean_part.to_string()
+        };
+
+        if has_r {
+            parts.push(processed + "\r");
+        } else {
+            parts.push(processed);
         }
-        Err(_) => body.to_string(),
     }
+
+    parts.join("\n")
 }
+
 
 fn openai_error(status: StatusCode, code: &str, message: &str, retry_after: Option<&str>) -> Response {
     let mut response = (
@@ -206,4 +252,24 @@ fn openai_error(status: StatusCode, code: &str, message: &str, retry_after: Opti
     }
 
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rewrite_model_alias_non_streaming() {
+        let json_body = r#"{"model":"llama-3-8b","choices":[]}"#;
+        let rewritten = rewrite_model_alias(json_body, "my-custom-model");
+        let parsed: Value = serde_json::from_str(&rewritten).unwrap();
+        assert_eq!(parsed["model"], "my-custom-model");
+    }
+
+    #[test]
+    fn test_rewrite_model_alias_streaming() {
+        let sse_chunk = r#"data: {"model":"llama-3-8b","choices":[]}"#;
+        let rewritten = rewrite_model_alias(sse_chunk, "my-custom-model");
+        assert!(rewritten.contains("my-custom-model"), "Expected model to be rewritten, got: {}", rewritten);
+    }
 }
