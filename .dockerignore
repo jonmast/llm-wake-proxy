@@ -1,0 +1,17 @@
+# Keep the build context small. The Dockerfile's `COPY . .` only needs
+# Cargo.toml, Cargo.lock, and src/.
+
+target/
+.git/
+.gitignore
+.dockerignore
+Dockerfile
+Makefile
+README.md
+docs/
+.scratch/
+*.md
+!src/**/*.md
+charts/
+node_modules/
+*.log

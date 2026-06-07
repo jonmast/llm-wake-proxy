@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "llm-wake-proxy.fullname" . }}
+  labels:
+    {{- include "llm-wake-proxy.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - name: http
+      port:       {{ .Values.service.port }}
+      targetPort: http
+      protocol:   TCP
+  selector:
+    {{- include "llm-wake-proxy.selectorLabels" . | nindent 4 }}

@@ -1,0 +1,135 @@
+# Default values for llm-wake-proxy.
+# Required at install time (override via -f or --set):
+#   ssh.host, ssh.user, wol.macAddress, proxy.modelPath
+#
+# Example:
+#   helm install llm-wake-proxy ./charts/llm-wake-proxy \
+#     --set ssh.host=llama.tailnet.example \
+#     --set ssh.user=jon \
+#     --set wol.macAddress=AA:BB:CC:DD:EE:FF \
+#     --set proxy.modelPath=/models/qwen2.5-7b-instruct-q4_k_m.gguf \
+#     --set proxy.modelAlias=qwen2.5-7b-instruct \
+#     --set ssh.existingSecret=llm-wake-proxy-ssh-key
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/<your-user>/llm-wake-proxy
+  tag: ""               # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""              # auto-generated when empty
+  annotations: {}
+
+# Pod-level security: never run as root, drop all caps, no privilege escalation.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+# Container-level security (distroless nonroot UID must match runAsUser).
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  type: ClusterIP
+  port: 3000
+  annotations: {}
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 1000m
+    memory: 512Mi
+
+# Liveness/readiness hit /healthz on the proxy listen port.
+probes:
+  liveness:
+    enabled: true
+    initialDelaySeconds: 5
+    periodSeconds: 15
+    timeoutSeconds: 3
+    failureThreshold: 3
+  readiness:
+    enabled: true
+    initialDelaySeconds: 2
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 3
+
+# Pod scheduling hints. The proxy is single-replica + stateful, so leave
+# anti-affinity soft by default.
+nodeSelector: {}
+tolerations: []
+affinity: {}
+priorityClassName: ""
+topologySpreadConstraints: []
+
+# Proxy behaviour (mirrors README env-var table).
+proxy:
+  listenPort: 3000
+  modelAlias: llm-wake-proxy
+  modelOwnedBy: llm-wake-proxy
+  modelProviderId: llama.cpp
+  embeddingsEnabled: true
+  warmMaxActiveRequests: 2
+  warmMaxQueuedRequests: 16
+  warmQueueTimeoutSecs: 30
+  coldStartMaxWaiting: 32
+  coldWaitBudgetSecs: 90
+  hardBootDeadlineSecs: 300
+  bootstrapPollIntervalMs: 1000
+  retryAfterSecs: 10
+  # Extra env vars (key/value) merged into the container env. Useful for
+  # RUST_LOG, etc.
+  extraEnv: []
+
+# Host / SSH settings.
+ssh:
+  host: ""              # required
+  user: ""              # required
+  port: 22
+  helperPath: /usr/local/bin/helper
+  modelPath: ""         # required
+  tunnelLocalPort: 18080
+  llamaServerPort: 8080
+
+  # Name of an existing Secret in the target namespace containing:
+  #   ssh-privatekey:  PEM-encoded private key (mode 0600)
+  #   known_hosts:     (optional) output of `ssh-keyscan <host>`
+  # The chart will mount it at /home/nonroot/.ssh/. Create it OUTSIDE of
+  # Helm; never commit the key to git.
+  existingSecret: ""
+
+  # Path inside the pod where the secret is mounted. Must match the SSH
+  # options the binary uses (we use the default ~/.ssh/ lookup).
+  mountPath: /home/nonroot/.ssh
+
+# Wake-on-LAN.
+wol:
+  macAddress: ""        # required, XX:XX:XX:XX:XX:XX
+  broadcastAddr: 255.255.255.255
+  port: 9
+
+# Optional kubectl-driven annotation for log routing.
+podAnnotations: {}
+labels: {}

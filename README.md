@@ -92,6 +92,95 @@ The helper manages these user-level systemd units:
 - `llama-server.service` - The `llama-server` process
 - `llm-inhibit-holder.service` - Transient systemd inhibitor to prevent suspend during lease
 
+## Deployment (Kubernetes)
+
+A multi-stage Dockerfile and Helm chart ship in this repo.
+
+### Build and push the image
+
+```bash
+# One-time: log in to your registry (example uses GHCR).
+echo $GITHUB_TOKEN | docker login ghcr.io -u <your-user> --password-stdin
+
+# Build and push. Override IMAGE / TAG to taste.
+make build IMAGE=ghcr.io/<your-user>/llm-wake-proxy TAG=0.1.0
+make push  IMAGE=ghcr.io/<your-user>/llm-wake-proxy TAG=0.1.0
+
+# Or multi-arch in one shot (requires buildx):
+make buildx IMAGE=ghcr.io/<your-user>/llm-wake-proxy TAG=0.1.0
+```
+
+The image is a distroless `cc-debian12:nonroot` base with both `llm-wake-proxy` and `llm-wake-proxy-helper` plus the OpenSSH client (for the tunnel and helper RPC). It runs as UID 65532 with all capabilities dropped, a read-only root filesystem, and `seccompProfile: RuntimeDefault`.
+
+### Provide the SSH key
+
+The proxy opens an SSH tunnel to the bare-metal host, so the pod needs a private key. Create the Secret **out of band** so the key never lands in git:
+
+```bash
+ssh-keygen -t ed25519 -N '' -f ~/.ssh/llm-wake-proxy
+ssh-keyscan -H llama.tailnet.example > known_hosts
+
+kubectl create namespace llm-wake-proxy
+
+kubectl create secret generic llm-wake-proxy-ssh-key \
+  --namespace llm-wake-proxy \
+  --from-file=ssh-privatekey=~/.ssh/llm-wake-proxy \
+  --from-file=known_hosts=known_hosts
+```
+
+Authorise the public key on the bare-metal host as usual (e.g. `~/.ssh/authorized_keys`).
+
+### Install the chart
+
+```bash
+helm install llm-wake-proxy ./charts/llm-wake-proxy \
+  --namespace llm-wake-proxy \
+  --set ssh.host=llama.tailnet.example \
+  --set ssh.user=jon \
+  --set wol.macAddress=AA:BB:CC:DD:EE:FF \
+  --set ssh.modelPath=/models/qwen2.5-7b-instruct-q4_k_m.gguf \
+  --set proxy.modelAlias=qwen2.5-7b-instruct \
+  --set ssh.existingSecret=llm-wake-proxy-ssh-key
+```
+
+Required values: `ssh.host`, `ssh.user`, `ssh.modelPath`, `wol.macAddress`. The chart enforces these with `required` and `helm install` will refuse to proceed without them.
+
+### Verify
+
+```bash
+kubectl --namespace llm-wake-proxy port-forward \
+  svc/llm-wake-proxy 8080:3000
+
+curl -s http://localhost:8080/healthz
+# {"status":"ok"}
+
+curl -s http://localhost:8080/status | jq
+```
+
+A cold host will return `503 warming_up` from `/v1/chat/completions` with a `Retry-After` header until WOL, SSH, and `llama-server` are all ready. See **Verification** below for the full status contract.
+
+### Chart values
+
+The full list lives in `charts/llm-wake-proxy/values.yaml`. Highlights:
+
+| Value | Default | Notes |
+|-------|---------|-------|
+| `replicaCount` | `1` | V1 keeps coordination state in memory. No HA. |
+| `service.type` | `ClusterIP` | Use `LoadBalancer`/`NodePort` to expose externally. |
+| `resources.requests/limits` | 100m/128Mi → 1000m/512Mi | Tune for your model. |
+| `probes.liveness/readiness` | enabled | Both hit `/healthz`. |
+| `ssh.mountPath` | `/home/nonroot/.ssh` | Override if you ship a different layout. |
+| `proxy.extraEnv` | `[]` | Merge arbitrary `env:` entries (e.g. `RUST_LOG=info`). |
+
+### Other useful targets
+
+```bash
+make lint        # cargo check + clippy + helm lint
+make render      # helm template dry-run with sane defaults
+make package     # helm package the chart into dist/
+make uninstall   # helm uninstall llm-wake-proxy
+```
+
 ## Verification
 
 ### Health

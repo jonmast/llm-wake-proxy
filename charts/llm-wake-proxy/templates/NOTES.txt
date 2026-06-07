@@ -1,0 +1,44 @@
+llm-wake-proxy has been installed.
+
+Release:    {{ .Release.Name }}
+Namespace:  {{ .Release.Namespace }}
+Service:    {{ include "llm-wake-proxy.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}
+
+{{- if not .Values.ssh.existingSecret }}
+
+NOTE: You have not set ssh.existingSecret. The pod will not be able to open
+the SSH tunnel to the bare-metal host. Create the Secret before continuing:
+
+  ssh-keygen -t ed25519 -N '' -f ~/.ssh/llm-wake-proxy
+  ssh-keyscan -H {{ required "ssh.host is required" .Values.ssh.host }} > known_hosts
+
+  kubectl create secret generic llm-wake-proxy-ssh-key \
+    --namespace {{ .Release.Namespace }} \
+    --from-file=ssh-privatekey=~/.ssh/llm-wake-proxy \
+    --from-file=known_hosts=known_hosts
+
+Then upgrade:
+
+  helm upgrade {{ .Release.Name }} ./charts/llm-wake-proxy \
+    --reuse-values \
+    --set ssh.existingSecret=llm-wake-proxy-ssh-key
+
+{{- end }}
+
+{{- if not .Values.ssh.host }}
+
+WARNING: ssh.host is empty. Set it (and ssh.user, wol.macAddress,
+ssh.modelPath) before expecting any traffic to flow:
+
+  helm upgrade {{ .Release.Name }} ./charts/llm-wake-proxy \
+    --set ssh.host=... --set ssh.user=... \
+    --set wol.macAddress=... --set ssh.modelPath=...
+
+{{- end }}
+
+Quick check:
+
+  kubectl --namespace {{ .Release.Namespace }} port-forward \
+      svc/{{ include "llm-wake-proxy.fullname" . }} 8080:{{ .Values.service.port }}
+  curl -s http://localhost:8080/healthz
+  curl -s http://localhost:8080/status | jq

@@ -1,0 +1,35 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "llm-wake-proxy.fullname" . }}-env
+  labels:
+    {{- include "llm-wake-proxy.labels" . | nindent 4 }}
+data:
+  # Proxy
+  PORT:                          {{ .Values.proxy.listenPort | quote }}
+  MODEL_ALIAS:                   {{ .Values.proxy.modelAlias | quote }}
+  MODEL_OWNED_BY:                {{ .Values.proxy.modelOwnedBy | quote }}
+  MODEL_PROVIDER_ID:             {{ .Values.proxy.modelProviderId | quote }}
+  EMBEDDINGS_ENABLED:            {{ .Values.proxy.embeddingsEnabled | quote }}
+  WARM_MAX_ACTIVE_REQUESTS:      {{ .Values.proxy.warmMaxActiveRequests | quote }}
+  WARM_MAX_QUEUED_REQUESTS:      {{ .Values.proxy.warmMaxQueuedRequests | quote }}
+  WARM_QUEUE_TIMEOUT_SECS:       {{ .Values.proxy.warmQueueTimeoutSecs | quote }}
+  COLD_START_MAX_WAITING:        {{ .Values.proxy.coldStartMaxWaiting | quote }}
+  COLD_WAIT_BUDGET_SECS:         {{ .Values.proxy.coldWaitBudgetSecs | quote }}
+  HARD_BOOT_DEADLINE_SECS:       {{ .Values.proxy.hardBootDeadlineSecs | quote }}
+  BOOTSTRAP_POLL_INTERVAL_MS:    {{ .Values.proxy.bootstrapPollIntervalMs | quote }}
+  RETRY_AFTER_SECS:              {{ .Values.proxy.retryAfterSecs | quote }}
+
+  # SSH / host
+  SSH_HOST:                      {{ required "ssh.host is required" .Values.ssh.host | quote }}
+  SSH_USER:                      {{ required "ssh.user is required" .Values.ssh.user | quote }}
+  SSH_PORT:                      {{ .Values.ssh.port | quote }}
+  HELPER_PATH:                   {{ .Values.ssh.helperPath | quote }}
+  MODEL_PATH:                    {{ required "ssh.modelPath is required" .Values.ssh.modelPath | quote }}
+  TUNNEL_LOCAL_PORT:             {{ .Values.ssh.tunnelLocalPort | quote }}
+  LLAMA_SERVER_PORT:             {{ .Values.ssh.llamaServerPort | quote }}
+
+  # Wake-on-LAN
+  WOL_MAC_ADDRESS:               {{ required "wol.macAddress is required" .Values.wol.macAddress | quote }}
+  WOL_BROADCAST_ADDR:            {{ .Values.wol.broadcastAddr | quote }}
+  WOL_PORT:                      {{ .Values.wol.port | quote }}
