@@ -6,14 +6,15 @@
 #   - /usr/local/bin/llm-wake-proxy           (the proxy)
 #   - /usr/local/bin/llm-wake-proxy-helper    (the host-side helper)
 #   - /usr/bin/ssh                            (for SSH tunnel + helper RPC)
+#   - /busybox/{sh,ls,cat,...}                (busybox applets for debugging)
 #
 # Build:    docker build -t ghcr.io/<user>/llm-wake-proxy:dev .
 # Push:     docker push ghcr.io/<user>/llm-wake-proxy:dev
 # Inspect:  docker run --rm ghcr.io/<user>/llm-wake-proxy:dev --version
 #
 # Notes:
-#   - Uses buildkit cache mounts for cargo registry/git/target. No third-party
-#     base image; only docker.io/library/* and gcr.io/distroless/* are pulled.
+#   - Uses buildkit cache mounts for cargo registry/git/target.
+#   - Sources: docker.io/library/*, gcr.io/distroless/*, busybox:stable.
 #   - Final image is distroless cc-debian12:nonroot (UID 65532).
 
 ARG RUST_VERSION=1.88
@@ -53,11 +54,18 @@ RUN apt-get update \
     && cp -r /usr/lib/openssh /out/openssh \
     && cp -r /lib/x86_64-linux-gnu /out/lib-x86_64-linux-gnu
 
+# ---- busybox for debugging (optional, exec via /busybox/sh) -------------------
+FROM docker.io/library/busybox:stable AS busybox
+RUN mkdir -p /out/busybox \
+    && cp /bin/busybox /out/busybox/busybox \
+    && for applet in $(busybox --list); do ln -s busybox /out/busybox/$applet; done
+
 # ---- final distroless image -------------------------------------------------
 FROM gcr.io/distroless/cc-debian12:nonroot
 
 COPY --from=builder     /usr/local/bin/llm-wake-proxy          /usr/local/bin/llm-wake-proxy
 COPY --from=builder     /usr/local/bin/llm-wake-proxy-helper   /usr/local/bin/llm-wake-proxy-helper
+COPY --from=busybox     /out/busybox                           /busybox
 COPY --from=ssh-runtime /out/ssh                               /usr/bin/ssh
 COPY --from=ssh-runtime /out/openssh                           /usr/lib/openssh
 # ssh needs libselinux/libkrb5/libfido2/libbsd/libmd which aren't in

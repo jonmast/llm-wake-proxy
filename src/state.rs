@@ -90,12 +90,14 @@ impl AppState {
             config.host.helper_path.clone(),
             config.host.model_path.clone(),
             config.model.alias.clone(),
+            config.host.ssh_key_path.clone(),
         );
         let tunnel = SshTunnelManager::new(
             config.host.ssh_user.clone(),
             config.host.host.clone(),
             config.host.tunnel_local_port,
             config.host.remote_port,
+            config.host.ssh_key_path.clone(),
         );
 
         let lifecycle = Arc::new(LifecycleManager::new(

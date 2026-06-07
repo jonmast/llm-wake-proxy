@@ -26,6 +26,7 @@ data:
   SSH_PORT:                      {{ .Values.ssh.port | quote }}
   HELPER_PATH:                   {{ .Values.ssh.helperPath | quote }}
   MODEL_PATH:                    {{ required "ssh.modelPath is required" .Values.ssh.modelPath | quote }}
+  SSH_KEY_PATH:                  {{ .Values.ssh.mountPath | quote }}/ssh-privatekey
   TUNNEL_LOCAL_PORT:             {{ .Values.ssh.tunnelLocalPort | quote }}
   LLAMA_SERVER_PORT:             {{ .Values.ssh.llamaServerPort | quote }}
 

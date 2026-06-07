@@ -39,6 +39,7 @@ pub struct HostConfig {
     pub wol_port: u16,
     pub helper_path: String,
     pub model_path: String,
+    pub ssh_key_path: String,
     pub tunnel_local_port: u16,
     pub remote_port: u16,
 }
@@ -99,6 +100,8 @@ impl AppConfig {
                 helper_path: read_var("HELPER_PATH")
                     .unwrap_or_else(|| "/usr/local/bin/helper".to_string()),
                 model_path: read_var("MODEL_PATH").expect("MODEL_PATH must be set"),
+                ssh_key_path: read_var("SSH_KEY_PATH")
+                    .unwrap_or_else(|| "~/.ssh/ssh-privatekey".to_string()),
                 tunnel_local_port: read_var("TUNNEL_LOCAL_PORT")
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(18080),
@@ -152,6 +155,7 @@ impl Default for HostConfig {
             wol_port: 9,
             helper_path: "/usr/local/bin/helper".to_string(),
             model_path: "/models/test-model.gguf".to_string(),
+            ssh_key_path: "~/.ssh/ssh-privatekey".to_string(),
             tunnel_local_port: 18080,
             remote_port: 8080,
         }

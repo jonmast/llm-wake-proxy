@@ -92,6 +92,7 @@ pub struct SshHelperRpc {
     helper_path: String,
     model_path: String,
     model_alias: String,
+    ssh_key_path: String,
 }
 
 impl SshHelperRpc {
@@ -101,6 +102,7 @@ impl SshHelperRpc {
         helper_path: String,
         model_path: String,
         model_alias: String,
+        ssh_key_path: String,
     ) -> Self {
         Self {
             ssh_user,
@@ -108,6 +110,7 @@ impl SshHelperRpc {
             helper_path,
             model_path,
             model_alias,
+            ssh_key_path,
         }
     }
 
@@ -120,6 +123,8 @@ impl SshHelperRpc {
             "BatchMode=yes",
             "-o",
             "StrictHostKeyChecking=accept-new",
+            "-i",
+            &self.ssh_key_path,
         ]);
         cmd.arg(format!("{}@{}", self.ssh_user, self.ssh_host));
         for arg in args {
@@ -238,6 +243,7 @@ impl HelperRpc for SshHelperRpc {
         let helper_path = self.helper_path.clone();
         let model_path = self.model_path.clone();
         let model_alias = self.model_alias.clone();
+        let ssh_key_path = self.ssh_key_path.clone();
 
         Box::pin(async move {
             let rpc = SshHelperRpc {
@@ -246,6 +252,7 @@ impl HelperRpc for SshHelperRpc {
                 helper_path,
                 model_path,
                 model_alias,
+                ssh_key_path,
             };
 
             let mut state = rpc.ensure_started().await?;
@@ -282,16 +289,18 @@ pub struct SshTunnelManager {
     ssh_host: String,
     local_port: u16,
     remote_port: u16,
+    ssh_key_path: String,
     proc: Mutex<Option<Child>>,
 }
 
 impl SshTunnelManager {
-    pub fn new(ssh_user: String, ssh_host: String, local_port: u16, remote_port: u16) -> Self {
+    pub fn new(ssh_user: String, ssh_host: String, local_port: u16, remote_port: u16, ssh_key_path: String) -> Self {
         Self {
             ssh_user,
             ssh_host,
             local_port,
             remote_port,
+            ssh_key_path,
             proc: Mutex::new(None),
         }
     }
@@ -299,23 +308,23 @@ impl SshTunnelManager {
     async fn create_tunnel(&self) -> Result<Child, LifecycleError> {
         let mut child = tokio::process::Command::new("ssh")
             .kill_on_drop(true)
-            .args([
-                "-o",
-                "ConnectTimeout=10",
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                "-o",
-                "ExitOnForwardFailure=yes",
-                "-L",
-                &format!(
-                    "127.0.0.1:{}:127.0.0.1:{}",
-                    self.local_port, self.remote_port
-                ),
-                "-N",
-                &format!("{}@{}", self.ssh_user, self.ssh_host),
-            ])
+            .arg("-o")
+            .arg("ConnectTimeout=10")
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg("StrictHostKeyChecking=accept-new")
+            .arg("-o")
+            .arg("ExitOnForwardFailure=yes")
+            .arg("-i")
+            .arg(&self.ssh_key_path)
+            .arg("-L")
+            .arg(format!(
+                "127.0.0.1:{}:127.0.0.1:{}",
+                self.local_port, self.remote_port
+            ))
+            .arg("-N")
+            .arg(format!("{}@{}", self.ssh_user, self.ssh_host))
             .spawn()
             .map_err(|e| LifecycleError::new(format!("failed to spawn SSH tunnel: {e}")))?;
 
