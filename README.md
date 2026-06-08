@@ -1,5 +1,7 @@
 # llm-wake-proxy
 
+> **⚠️ Alpha quality / personal project.** This works for my setup but has rough edges, minimal error handling in places, and no stability guarantees. Not recommended for production or any environment where reliability matters.
+
 A standalone Rust proxy that keeps a private `llama.cpp` model host asleep when idle and wakes it on demand. Exposes an OpenAI-compatible API so standard clients like `opencode` work without custom glue.
 
 ## Architecture
@@ -111,6 +113,8 @@ make buildx IMAGE=ghcr.io/<your-user>/llm-wake-proxy TAG=0.1.0
 ```
 
 The image is a distroless `cc-debian12:nonroot` base with both `llm-wake-proxy` and `llm-wake-proxy-helper` plus the OpenSSH client (for the tunnel and helper RPC). It runs as UID 65532 with all capabilities dropped, a read-only root filesystem, and `seccompProfile: RuntimeDefault`.
+
+> **Note:** The chart defaults to `hostNetwork: true` because Wake-on-LAN requires sending a UDP broadcast from the node’s physical network interface. Standard pod networking isolates the broadcast, so the magic packet never reaches the LAN.
 
 ### Provide the SSH key
 

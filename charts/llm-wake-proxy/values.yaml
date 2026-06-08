@@ -70,6 +70,9 @@ global:
   labels: {}
 
 defaultPodOptions:
+  # Required for Wake-on-LAN: the pod must share the node’s network
+  # namespace so UDP broadcasts reach the physical LAN.
+  hostNetwork: true
   securityContext:
     runAsNonRoot: true
     runAsUser: 65532

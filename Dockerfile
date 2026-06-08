@@ -58,7 +58,9 @@ RUN apt-get update \
 FROM docker.io/library/busybox:stable AS busybox
 RUN mkdir -p /out/busybox \
     && cp /bin/busybox /out/busybox/busybox \
-    && for applet in $(busybox --list); do ln -s busybox /out/busybox/$applet; done
+    && for applet in $(busybox --list); do ln -s busybox /out/busybox/$applet; done \
+    && mkdir -p /out/bin \
+    && ln -s /busybox/sh /out/bin/sh
 
 # ---- final distroless image -------------------------------------------------
 FROM gcr.io/distroless/cc-debian12:nonroot
@@ -66,6 +68,7 @@ FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=builder     /usr/local/bin/llm-wake-proxy          /usr/local/bin/llm-wake-proxy
 COPY --from=builder     /usr/local/bin/llm-wake-proxy-helper   /usr/local/bin/llm-wake-proxy-helper
 COPY --from=busybox     /out/busybox                           /busybox
+COPY --from=busybox     /out/bin                               /bin
 COPY --from=ssh-runtime /out/ssh                               /usr/bin/ssh
 COPY --from=ssh-runtime /out/openssh                           /usr/lib/openssh
 # ssh needs libselinux/libkrb5/libfido2/libbsd/libmd which aren't in
