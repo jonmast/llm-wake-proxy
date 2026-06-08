@@ -2,13 +2,17 @@ apiVersion: v2
 name: llm-wake-proxy
 description: OpenAI-compatible proxy that wakes a private llama.cpp host on demand.
 type: application
-version: 0.2.2
+version: 0.3.0
 appVersion: "0.1.0"
-home: https://github.com/<your-user>/llm-wake-proxy
+home: https://github.com/jonmast/llm-wake-proxy
 keywords:
   - llm
   - llama.cpp
   - openai
   - wake-on-lan
 maintainers:
-  - name: <your-user>
+  - name: jonmast
+dependencies:
+  - name: common
+    version: 5.0.1
+    repository: https://bjw-s-labs.github.io/helm-charts
