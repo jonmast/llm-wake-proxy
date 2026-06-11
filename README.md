@@ -46,7 +46,7 @@ All configuration is via environment variables.
 | `SSH_HOST` | (required) | Bare-metal host address (IP or Tailscale hostname) |
 | `SSH_USER` | (required) | SSH user on the host |
 | `SSH_PORT` | `22` | SSH port |
-| `HELPER_PATH` | `/usr/local/bin/helper` | Path to helper binary on host |
+| `HELPER_PATH` | `/usr/local/bin/llm-wake-proxy-helper` | Path to helper binary on host |
 | `MODEL_PATH` | (required) | Path to model file on host (for model verification) |
 | `TUNNEL_LOCAL_PORT` | `18080` | Local port for SSH tunnel |
 | `LLAMA_SERVER_PORT` | `8080` | Remote port on host (llama-server) |
@@ -77,7 +77,7 @@ The helper binary (`llm-wake-proxy-helper`) runs on the host over SSH. It provid
 llm-wake-proxy-helper status
 
 # Ensure llama-server is started (idempotent, singleton)
-llm-wake-proxy-helper ensure-started --model-path /models/model.gguf --model-alias default
+EXPECTED_MODEL_PATH=/models/model.gguf llm-wake-proxy-helper ensure-started default
 
 # Lease management
 llm-wake-proxy-helper lease acquire --ttl 3600
@@ -89,10 +89,47 @@ All subcommands emit JSON on stdout and reserve stderr for human diagnostics.
 
 ### systemd Units
 
-The helper manages these user-level systemd units:
+The helper manages two user-level systemd units:
 
-- `llama-server.service` - The `llama-server` process
-- `llm-inhibit-holder.service` - Transient systemd inhibitor to prevent suspend during lease
+- **`llama-server.service`** — A static unit you create once. The helper starts it on demand via `systemctl --user start llama-server`. It should be **disabled** (not enabled for auto-start) so the host can sleep when idle.
+- **`llm-wake-proxy-inhibit`** — A transient unit created by `systemd-run` when the proxy acquires a lease. It runs `systemd-inhibit --what=sleep` to keep the host awake while requests are active. The helper removes it when the lease is released or expires.
+
+### Installing the llama-server unit
+
+Create `~/.config/systemd/user/llama-server.service` and edit the `ExecStart` line to point at your model and `llama-server` binary:
+
+```ini
+[Unit]
+Description=llama.cpp server for llm-wake-proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/llama-server \
+    -m /models/your-model.gguf \
+    --host 127.0.0.1 \
+    --port 8080 \
+    -np 4
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+```
+
+Then reload and **disable** it (so it only starts on-demand):
+
+```bash
+systemctl --user daemon-reload
+systemctl --user disable llama-server.service
+```
+
+If the host needs to work while nobody is logged in, enable lingering for the user:
+
+```bash
+sudo loginctl enable-linger "$USER"
+```
 
 ## Deployment (Kubernetes)
 
@@ -144,7 +181,9 @@ helm install llm-wake-proxy ./charts/llm-wake-proxy \
   --set wol.macAddress=AA:BB:CC:DD:EE:FF \
   --set ssh.modelPath=/models/qwen2.5-7b-instruct-q4_k_m.gguf \
   --set proxy.modelAlias=qwen2.5-7b-instruct \
-  --set ssh.existingSecret=llm-wake-proxy-ssh-key
+  --set ssh.existingSecret=llm-wake-proxy-ssh-key \
+  --set persistence.ssh-key.enabled=true \
+  --set controllers.main.containers.main.image.repository=ghcr.io/jonmast/llm-wake-proxy
 ```
 
 Required values: `ssh.host`, `ssh.user`, `ssh.modelPath`, `wol.macAddress`. The chart enforces these with `required` and `helm install` will refuse to proceed without them.

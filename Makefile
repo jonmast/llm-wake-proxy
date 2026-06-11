@@ -65,12 +65,24 @@ test: ## cargo test
 
 # --- Helm --------------------------------------------------------------------
 
+.PHONY: helm-deps
+helm-deps: ## fetch and unpack helm chart dependencies
+	@if ! $(HELM) dependency list $(CHART) | tail -n +2 | grep -q 'ok[[:space:]]*$$'; then \
+		$(HELM) dependency build $(CHART); \
+	fi
+	@cd $(CHART)/charts && for f in *.tgz; do \
+		dir="$${f%-*.tgz}"; \
+		if [ ! -d "$$dir" ]; then \
+			tar -xzf "$$f"; \
+		fi; \
+	done
+
 .PHONY: helm-lint
-helm-lint: ## helm lint the chart
+helm-lint: helm-deps ## helm lint the chart
 	$(HELM) lint $(CHART)
 
 .PHONY: render
-render: ## helm template render (no install). Use --set to fill required values.
+render: helm-deps ## helm template render (no install). Use --set to fill required values.
 	$(HELM) template release $(CHART) \
 		--set ssh.host=llama.example \
 		--set ssh.user=jon \
@@ -79,11 +91,11 @@ render: ## helm template render (no install). Use --set to fill required values.
 		--set proxy.modelAlias=qwen2.5-7b-instruct
 
 .PHONY: install
-install: ## helm install. Pass extra flags via HELM_FLAGS=...
+install: helm-deps ## helm install. Pass extra flags via HELM_FLAGS=...
 	$(HELM) install llm-wake-proxy $(CHART) $(HELM_FLAGS)
 
 .PHONY: upgrade
-upgrade: ## helm upgrade. Pass extra flags via HELM_FLAGS=...
+upgrade: helm-deps ## helm upgrade. Pass extra flags via HELM_FLAGS=...
 	$(HELM) upgrade llm-wake-proxy $(CHART) $(HELM_FLAGS)
 
 .PHONY: uninstall
@@ -91,7 +103,7 @@ uninstall: ## helm uninstall
 	$(HELM) uninstall llm-wake-proxy
 
 .PHONY: package
-package: ## helm package the chart into dist/
+package: helm-deps ## helm package the chart into dist/
 	@mkdir -p $(DIST)
 	$(HELM) package $(CHART) --destination $(DIST)
 

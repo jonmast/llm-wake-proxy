@@ -1,5 +1,5 @@
 .scratch/
 target/
 
-# Helm dependency tarballs — fetched at deploy time by Flux.
-**/charts/*.tgz
+# Helm dependencies — fetched at build time.
+charts/*/charts/

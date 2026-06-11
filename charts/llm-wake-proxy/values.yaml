@@ -38,7 +38,7 @@ ssh:
   host: ""              # required
   user: ""              # required
   port: 22
-  helperPath: /usr/local/bin/helper
+  helperPath: /usr/local/bin/llm-wake-proxy-helper
   modelPath: ""         # required
   tunnelLocalPort: 18080
   llamaServerPort: 8080

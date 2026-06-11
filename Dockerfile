@@ -55,12 +55,14 @@ RUN apt-get update \
     && cp -r /lib/x86_64-linux-gnu /out/lib-x86_64-linux-gnu
 
 # ---- busybox for debugging (optional, exec via /busybox/sh) -------------------
-FROM docker.io/library/busybox:stable AS busybox
-RUN mkdir -p /out/busybox \
+FROM docker.io/library/busybox:stable-musl AS busybox
+RUN mkdir -p /out/busybox /out/bin /out/usr/bin \
     && cp /bin/busybox /out/busybox/busybox \
-    && for applet in $(busybox --list); do ln -s busybox /out/busybox/$applet; done \
-    && mkdir -p /out/bin \
-    && ln -s /busybox/sh /out/bin/sh
+    && for applet in $(busybox --list); do \
+         ln -s busybox /out/busybox/$applet; \
+         ln -s /busybox/$applet /out/bin/$applet 2>/dev/null || true; \
+         ln -s /busybox/$applet /out/usr/bin/$applet 2>/dev/null || true; \
+       done
 
 # ---- final distroless image -------------------------------------------------
 FROM gcr.io/distroless/cc-debian12:nonroot
