@@ -2,14 +2,14 @@
 # llm-wake-proxy — bjw-s common library chart values
 # ============================================================================
 # Required at install time (override via -f or --set):
-#   ssh.host, ssh.user, wol.macAddress, proxy.modelPath
+#   ssh.host, ssh.user, wol.macAddress, ssh.modelPath
 #
 # Example:
 #   helm install llm-wake-proxy ./charts/llm-wake-proxy \
 #     --set ssh.host=llama.tailnet.example \
 #     --set ssh.user=jon \
 #     --set wol.macAddress=AA:BB:CC:DD:EE:FF \
-#     --set proxy.modelPath=/models/qwen2.5-7b-instruct-q4_k_m.gguf \
+#     --set ssh.modelPath=/models/qwen2.5-7b-instruct-q4_k_m.gguf \
 #     --set proxy.modelAlias=qwen2.5-7b-instruct \
 #     --set controllers.main.containers.main.image.repository=ghcr.io/jonmast/llm-wake-proxy \
 #     --set persistence.ssh-key.enabled=true \
