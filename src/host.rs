@@ -238,27 +238,11 @@ impl HelperRpc for SshHelperRpc {
         &self,
         _request: &LifecycleRequest,
     ) -> LifecycleFuture<'_, Result<ObservedBackendState, LifecycleError>> {
-        let ssh_user = self.ssh_user.clone();
-        let ssh_host = self.ssh_host.clone();
-        let helper_path = self.helper_path.clone();
-        let model_path = self.model_path.clone();
-        let model_alias = self.model_alias.clone();
-        let ssh_key_path = self.ssh_key_path.clone();
-
         Box::pin(async move {
-            let rpc = SshHelperRpc {
-                ssh_user,
-                ssh_host,
-                helper_path,
-                model_path,
-                model_alias,
-                ssh_key_path,
-            };
-
-            let mut state = rpc.ensure_started().await?;
+            let mut state = self.ensure_started().await?;
 
             if matches!(state.lifecycle, LifecycleState::Ready) {
-                if let Ok(status_state) = rpc.fetch_status().await {
+                if let Ok(status_state) = self.fetch_status().await {
                     state.llama_server_unit = status_state.llama_server_unit;
                     state.inhibit_unit = status_state.inhibit_unit;
                 }
