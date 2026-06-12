@@ -1,5 +1,5 @@
-# Keep the build context small. The Dockerfile's `COPY . .` only needs
-# Cargo.toml, Cargo.lock, and src/.
+# Keep the build context small. The Dockerfile only copies
+# Cargo.toml, Cargo.lock, and src/ selectively.
 
 target/
 .git/

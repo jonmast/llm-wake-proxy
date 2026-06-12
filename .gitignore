@@ -1,5 +1,6 @@
 .scratch/
 target/
+dist/
 
 # Helm dependencies — fetched at build time.
 charts/*/charts/

@@ -56,12 +56,11 @@ RUN apt-get update \
 
 # ---- busybox for debugging (optional, exec via /busybox/sh) -------------------
 FROM docker.io/library/busybox:stable-musl AS busybox
-RUN mkdir -p /out/busybox /out/bin /out/usr/bin \
+RUN mkdir -p /out/busybox /out/bin \
     && cp /bin/busybox /out/busybox/busybox \
     && for applet in $(busybox --list); do \
          ln -s busybox /out/busybox/$applet; \
          ln -s /busybox/$applet /out/bin/$applet 2>/dev/null || true; \
-         ln -s /busybox/$applet /out/usr/bin/$applet 2>/dev/null || true; \
        done
 
 # ---- final distroless image -------------------------------------------------

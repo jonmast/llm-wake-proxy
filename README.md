@@ -229,7 +229,7 @@ Returns:
 ```json
 {
   "state": "ready",
-  "model_alias": "default",
+  "model_alias": "llm-wake-proxy",
   "capabilities": {
     "chat": "ready",
     "embeddings": "ready"
@@ -275,7 +275,11 @@ Returns:
 | `503` | `backend_unavailable` | Backend ready but forwarding failed |
 | `429` | `overloaded` | Warm execution queue is full or timed out |
 | `400` | `invalid_request_error` | Bad JSON, unsupported fields, bad model |
+| `400` | `unsupported_role` | Unsupported message role in chat request |
+| `400` | `model_not_found` | Requested model doesn't match configured alias |
 | `400` | `unsupported_embeddings` | Embeddings disabled or degraded |
+| `503` | `upstream_error` | Upstream backend returned an error |
+| `503` | `request_cancelled` | Request cancelled (lease timeout, etc.) |
 
 ## Metrics
 
