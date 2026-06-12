@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use crate::{
     forward::{self, ForwardConfig},
     lifecycle::{CapabilityState, LifecycleDecision, LifecycleRequest},
-    scheduler::WarmExecutionError,
+    scheduler::{RequestCancellation, WarmExecutionError},
     state::AppState,
 };
 
@@ -312,25 +312,29 @@ async fn inference_response(
                 LifecycleRequest::Embeddings => "/v1/embeddings",
             };
 
+            let forward_body = body_bytes.clone();
+            let forward_config = config.clone();
+            let forward_model_alias = model_alias.clone();
+
             match state
                 .scheduler
-                .execute(request_kind, |cancellation| async move {
+                .execute(request_kind.clone(), |cancellation| async move {
                     if stream {
                         forward::forward_streaming(
-                            &config,
+                            &forward_config,
                             path,
-                            body_bytes,
+                            forward_body,
                             &cancellation,
-                            &model_alias,
+                            &forward_model_alias,
                         )
                         .await
                     } else {
                         forward::forward_non_streaming(
-                            &config,
+                            &forward_config,
                             path,
-                            body_bytes,
+                            forward_body,
                             &cancellation,
-                            &model_alias,
+                            &forward_model_alias,
                         )
                         .await
                     }
@@ -344,6 +348,43 @@ async fn inference_response(
                 Ok(Err(forward::ForwardError::EmbeddingsUnsupported)) => {
                     state.metrics.inc_embeddings_degraded();
                     embedding_degradation_response(&state, "upstream returned 404").await
+                }
+                Ok(Err(forward::ForwardError::UpstreamUnreachable)) => {
+                    state.metrics.inc_cold_starts();
+                    state.metrics.inc_wake_attempts();
+                    state.lifecycle.mark_warming();
+                    match state.lifecycle.ensure_backend(request_kind).await {
+                        LifecycleDecision::Ready(_) => {
+                            let cancellation = RequestCancellation::new();
+                            if stream {
+                                forward::forward_streaming(
+                                    &config, path, body_bytes, &cancellation, &model_alias,
+                                )
+                                .await
+                                .unwrap_or_else(|e| e.to_openai())
+                            } else {
+                                forward::forward_non_streaming(
+                                    &config, path, body_bytes, &cancellation, &model_alias,
+                                )
+                                .await
+                                .unwrap_or_else(|e| e.to_openai())
+                            }
+                        }
+                        LifecycleDecision::Warming {
+                            retry_after_secs, ..
+                        } => openai_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "warming_up",
+                            "backend is still starting".to_string(),
+                            Some(&retry_after_secs.to_string()),
+                        ),
+                        LifecycleDecision::Failed { error, .. } => openai_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "backend_error",
+                            error.message,
+                            None,
+                        ),
+                    }
                 }
                 Ok(Err(error)) => {
                     state.metrics.inc_forwarding_errors();
@@ -671,6 +712,8 @@ mod tests {
         ) -> crate::lifecycle::LifecycleFuture<'_, ()> {
             Box::pin(async move {})
         }
+
+        fn mark_warming(&self) {}
     }
 
     fn test_config() -> AppConfig {

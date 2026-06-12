@@ -170,6 +170,7 @@ pub trait LifecycleOrchestrator: Send + Sync {
     fn ensure_backend(&self, request: LifecycleRequest) -> LifecycleFuture<'_, LifecycleDecision>;
     fn status(&self) -> BackendStatus;
     fn degrade_embeddings(&self, reason: String) -> LifecycleFuture<'_, ()>;
+    fn mark_warming(&self);
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -561,18 +562,7 @@ where
             let bootstrap_active = self.core.bootstrap.lock().await.active;
 
             if !bootstrap_active && backend_is_ready(&initial_status) {
-                match self
-                    .core
-                    .observe_once(None, request.clone(), initial_status.clone())
-                    .await
-                {
-                    ready @ LifecycleDecision::Ready(_) => return ready,
-                    LifecycleDecision::Failed { status, error } => {
-                        self.core.publish(status.clone());
-                        return LifecycleDecision::Failed { status, error };
-                    }
-                    LifecycleDecision::Warming { .. } => {}
-                }
+                return LifecycleDecision::Ready(initial_status);
             }
 
             let (should_start, status_rx, initial_status) = self
@@ -623,6 +613,13 @@ where
             status.embeddings_reason = Some(reason);
             self.core.publish(status);
         })
+    }
+
+    fn mark_warming(&self) {
+        let mut status = self.core.state.snapshot();
+        status.lifecycle = LifecycleState::Warming;
+        status.tunnel = TunnelState::Down;
+        self.core.publish(status);
     }
 }
 
@@ -1141,18 +1138,17 @@ mod tests {
         let decision = lifecycle.ensure_backend(LifecycleRequest::Chat).await;
 
         match decision {
-            LifecycleDecision::Warming { status, .. } => {
-                assert_eq!(status.lifecycle, LifecycleState::Warming);
-                assert_eq!(status.tunnel, TunnelState::Down);
-                assert_eq!(status.last_wake_attempt_at, Some(Timestamp::new(FAKE_NOW)));
+            LifecycleDecision::Ready(status) => {
+                assert_eq!(status.lifecycle, LifecycleState::Ready);
+                assert_eq!(status.tunnel, TunnelState::Ready);
             }
-            other => panic!("expected warming decision, got {other:?}"),
+            other => panic!("expected ready decision, got {other:?}"),
         }
 
         let latest = state.latest();
-        assert_eq!(latest.lifecycle, LifecycleState::Warming);
-        assert_eq!(latest.tunnel, TunnelState::Down);
-        assert_eq!(wake.call_count(), 1);
+        assert_eq!(latest.lifecycle, LifecycleState::Ready);
+        assert_eq!(latest.tunnel, TunnelState::Ready);
+        assert_eq!(wake.call_count(), 0);
     }
 
     #[tokio::test]
@@ -1190,7 +1186,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn warm_backend_reuses_existing_readiness_without_requesting_wake() {
+    async fn warm_backend_reuses_existing_readiness_without_requesting_wake_or_observe() {
         let wake = FakeWakeRequester::default();
         let helper = FakeHelperRpc::ready();
         let tunnel = FakeTunnelOwner::new(TunnelState::Ready);
@@ -1221,8 +1217,8 @@ mod tests {
         }
 
         assert_eq!(wake.call_count(), 0);
-        assert_eq!(helper.call_count(), 1);
-        assert_eq!(tunnel.call_count(), 1);
+        assert_eq!(helper.call_count(), 0);
+        assert_eq!(tunnel.call_count(), 0);
         assert_eq!(state.latest().lifecycle, LifecycleState::Ready);
     }
 
@@ -1254,8 +1250,8 @@ mod tests {
         assert!(matches!(first, LifecycleDecision::Ready(_)));
         assert!(matches!(second, LifecycleDecision::Ready(_)));
         assert_eq!(wake.call_count(), 0);
-        assert_eq!(helper.call_count(), 2);
-        assert_eq!(tunnel.call_count(), 2);
+        assert_eq!(helper.call_count(), 0);
+        assert_eq!(tunnel.call_count(), 0);
     }
 
     #[tokio::test]
@@ -1387,9 +1383,9 @@ mod tests {
             lifecycle.ensure_backend(LifecycleRequest::Embeddings)
         );
 
-        assert!(matches!(first, LifecycleDecision::Warming { .. }));
-        assert!(matches!(second, LifecycleDecision::Warming { .. }));
-        assert_eq!(wake.call_count(), 1);
+        assert!(matches!(first, LifecycleDecision::Ready { .. }));
+        assert!(matches!(second, LifecycleDecision::Ready { .. }));
+        assert_eq!(wake.call_count(), 0);
     }
 
     #[tokio::test]

@@ -9,11 +9,12 @@ use tracing::warn;
 
 use crate::scheduler::RequestCancellation;
 
+#[derive(Clone, Debug)]
 pub struct ForwardConfig {
     pub port: u16,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum ForwardError {
     UpstreamUnreachable,
     UpstreamError(u16, String),

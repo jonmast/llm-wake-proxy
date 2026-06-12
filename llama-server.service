@@ -1,0 +1,17 @@
+[Unit]
+Description=llama.cpp server for llm-wake-proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/llama-server \
+    -m /models/your-model.gguf \
+    --host 127.0.0.1 \
+    --port 8080 \
+    -np 4
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

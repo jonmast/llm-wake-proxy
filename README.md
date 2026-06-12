@@ -96,26 +96,12 @@ The helper manages two user-level systemd units:
 
 ### Installing the llama-server unit
 
-Create `~/.config/systemd/user/llama-server.service` and edit the `ExecStart` line to point at your model and `llama-server` binary:
+Copy `llama-server.service` from this repo to `~/.config/systemd/user/` on the host and edit the `ExecStart` line to point at your model and `llama-server` binary:
 
-```ini
-[Unit]
-Description=llama.cpp server for llm-wake-proxy
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/llama-server \
-    -m /models/your-model.gguf \
-    --host 127.0.0.1 \
-    --port 8080 \
-    -np 4
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=default.target
+```bash
+mkdir -p ~/.config/systemd/user
+cp llama-server.service ~/.config/systemd/user/
+# Edit ExecStart to match your setup
 ```
 
 Then reload and **disable** it (so it only starts on-demand):
