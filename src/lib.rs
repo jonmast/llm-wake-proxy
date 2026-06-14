@@ -6,5 +6,6 @@ pub mod host;
 pub(crate) mod http_error;
 pub mod lifecycle;
 pub mod metrics;
+pub mod orchestrate;
 pub mod scheduler;
 pub mod state;

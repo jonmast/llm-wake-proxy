@@ -11,10 +11,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
-    forward::{self, ForwardConfig},
     http_error::openai_error,
-    lifecycle::{CapabilityState, LifecycleDecision, LifecycleRequest},
-    scheduler::{RequestCancellation, WarmExecutionError},
+    lifecycle::LifecycleRequest,
+    orchestrate::Orchestrator,
     state::AppState,
 };
 
@@ -207,7 +206,9 @@ async fn chat_completions(
         );
     }
 
-    inference_response(state, LifecycleRequest::Chat, raw_body, payload.stream).await
+    Orchestrator::new(state)
+        .execute(LifecycleRequest::Chat, raw_body, payload.stream)
+        .await
 }
 
 async fn embeddings(
@@ -259,192 +260,9 @@ async fn embeddings(
         );
     }
 
-    inference_response(state, LifecycleRequest::Embeddings, raw_body, false).await
-}
-
-async fn inference_response(
-    state: AppState,
-    request_kind: LifecycleRequest,
-    body_bytes: axum::body::Bytes,
-    stream: bool,
-) -> Response {
-    let config = ForwardConfig {
-        port: state.config.host.tunnel_local_port,
-    };
-    let model_alias = state.config.model.alias.clone();
-
-    let _cold_permit = if state.is_cold() {
-        match state.cold_start_semaphore.clone().try_acquire_owned() {
-            Ok(permit) => Some(permit),
-            Err(_) => {
-                return openai_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "warming_up",
-                    "cold-start queue is full, retry later".to_string(),
-                    Some("10"),
-                );
-            }
-        }
-    } else {
-        None
-    };
-
-    match state.lifecycle.ensure_backend(request_kind.clone()).await {
-        LifecycleDecision::Ready(status) => {
-            if state.check_tunnel_drop(status.tunnel) {
-                state.metrics.inc_tunnel_drops();
-            }
-
-            if request_kind == LifecycleRequest::Embeddings
-                && status.embeddings == CapabilityState::Degraded
-            {
-                return openai_error(
-                    StatusCode::BAD_REQUEST,
-                    "unsupported_embeddings",
-                    status
-                        .embeddings_reason
-                        .unwrap_or_else(|| "embeddings are degraded".to_string()),
-                    None,
-                );
-            }
-
-            let path = match request_kind {
-                LifecycleRequest::Chat => "/v1/chat/completions",
-                LifecycleRequest::Embeddings => "/v1/embeddings",
-            };
-
-            let forward_body = body_bytes.clone();
-            let forward_config = config.clone();
-            let forward_model_alias = model_alias.clone();
-
-            match state
-                .scheduler
-                .execute(request_kind.clone(), |cancellation| async move {
-                    if stream {
-                        forward::forward_streaming(
-                            &forward_config,
-                            path,
-                            forward_body,
-                            &cancellation,
-                            &forward_model_alias,
-                        )
-                        .await
-                    } else {
-                        forward::forward_non_streaming(
-                            &forward_config,
-                            path,
-                            forward_body,
-                            &cancellation,
-                            &forward_model_alias,
-                        )
-                        .await
-                    }
-                })
-                .await
-            {
-                Ok(Ok(response)) => {
-                    state.metrics.inc_warm_requests();
-                    response
-                }
-                Ok(Err(forward::ForwardError::EmbeddingsUnsupported)) => {
-                    state.metrics.inc_embeddings_degraded();
-                    embedding_degradation_response(&state, "upstream returned 404").await
-                }
-                Ok(Err(forward::ForwardError::UpstreamUnreachable)) => {
-                    state.metrics.inc_cold_starts();
-                    state.metrics.inc_wake_attempts();
-                    state.lifecycle.mark_warming();
-                    match state.lifecycle.ensure_backend(request_kind).await {
-                        LifecycleDecision::Ready(_) => {
-                            let cancellation = RequestCancellation::new();
-                            if stream {
-                                forward::forward_streaming(
-                                    &config, path, body_bytes, &cancellation, &model_alias,
-                                )
-                                .await
-                                .unwrap_or_else(|e| e.to_openai())
-                            } else {
-                                forward::forward_non_streaming(
-                                    &config, path, body_bytes, &cancellation, &model_alias,
-                                )
-                                .await
-                                .unwrap_or_else(|e| e.to_openai())
-                            }
-                        }
-                        LifecycleDecision::Warming {
-                            retry_after_secs, ..
-                        } => openai_error(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "warming_up",
-                            "backend is still starting".to_string(),
-                            Some(&retry_after_secs.to_string()),
-                        ),
-                        LifecycleDecision::Failed { error, .. } => openai_error(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "backend_error",
-                            error.message,
-                            None,
-                        ),
-                    }
-                }
-                Ok(Err(error)) => {
-                    state.metrics.inc_forwarding_errors();
-                    error.to_openai()
-                }
-                Err(WarmExecutionError::QueueFull) => {
-                    state.metrics.inc_queue_full();
-                    warm_execution_error_response(WarmExecutionError::QueueFull)
-                }
-                Err(WarmExecutionError::QueueTimeout) => {
-                    state.metrics.inc_queue_timeouts();
-                    warm_execution_error_response(WarmExecutionError::QueueTimeout)
-                }
-            }
-        }
-        LifecycleDecision::Warming {
-            retry_after_secs, ..
-        } => {
-            state.metrics.inc_cold_starts();
-            state.metrics.inc_wake_attempts();
-            openai_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "warming_up",
-                "backend is still starting".to_string(),
-                Some(&retry_after_secs.to_string()),
-            )
-        }
-        LifecycleDecision::Failed { error, .. } => {
-            state.metrics.inc_wake_failures();
-            openai_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "backend_error",
-                error.message,
-                None,
-            )
-        }
-    }
-}
-
-async fn embedding_degradation_response(state: &AppState, reason: &str) -> Response {
-    state
-        .lifecycle
-        .degrade_embeddings(reason.to_string())
-        .await;
-    openai_error(
-        StatusCode::BAD_REQUEST,
-        "unsupported_embeddings",
-        format!("upstream backend does not support embeddings: {reason}"),
-        None,
-    )
-}
-
-fn warm_execution_error_response(error: WarmExecutionError) -> Response {
-    openai_error(
-        StatusCode::TOO_MANY_REQUESTS,
-        "overloaded",
-        error.message().to_string(),
-        None,
-    )
+    Orchestrator::new(state)
+        .execute(LifecycleRequest::Embeddings, raw_body, false)
+        .await
 }
 
 #[derive(Debug, Deserialize)]
@@ -649,8 +467,8 @@ mod tests {
     use crate::{
         config::{AppConfig, EmbeddingsConfig, ModelConfig, WarmExecutionConfig},
         lifecycle::{
-            BackendStatus, CapabilityState, LifecycleError, LifecycleOrchestrator, LifecycleState,
-            Timestamp, TunnelState, UnitState,
+            BackendStatus, CapabilityState, LifecycleDecision, LifecycleError,
+            LifecycleOrchestrator, LifecycleState, Timestamp, TunnelState, UnitState,
         },
         scheduler::WarmExecutionScheduler,
         state::AppState,
