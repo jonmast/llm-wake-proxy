@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 
 use crate::{
     forward::{self, ForwardConfig},
+    http_error::openai_error,
     lifecycle::{CapabilityState, LifecycleDecision, LifecycleRequest},
     scheduler::{RequestCancellation, WarmExecutionError},
     state::AppState,
@@ -444,35 +445,6 @@ fn warm_execution_error_response(error: WarmExecutionError) -> Response {
         error.message().to_string(),
         None,
     )
-}
-
-fn openai_error(
-    status: StatusCode,
-    code: &str,
-    message: String,
-    retry_after: Option<&str>,
-) -> Response {
-    let mut response = (
-        status,
-        Json(json!({
-            "error": {
-                "message": message,
-                "type": code,
-                "param": Value::Null,
-                "code": code,
-            }
-        })),
-    )
-        .into_response();
-
-    if let Some(retry_after) = retry_after {
-        response.headers_mut().insert(
-            axum::http::header::RETRY_AFTER,
-            retry_after.parse().expect("valid retry-after header"),
-        );
-    }
-
-    response
 }
 
 #[derive(Debug, Deserialize)]

@@ -3,6 +3,7 @@ pub mod config;
 pub mod forward;
 pub mod helper;
 pub mod host;
+pub(crate) mod http_error;
 pub mod lifecycle;
 pub mod metrics;
 pub mod scheduler;

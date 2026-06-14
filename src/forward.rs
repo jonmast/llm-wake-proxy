@@ -4,9 +4,10 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use futures_util::StreamExt;
-use serde_json::{Value, json};
+use serde_json::Value;
 use tracing::warn;
 
+use crate::http_error::openai_error;
 use crate::scheduler::RequestCancellation;
 
 #[derive(Clone, Debug)]
@@ -28,25 +29,25 @@ impl ForwardError {
             Self::UpstreamUnreachable => openai_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "backend_unavailable",
-                "upstream backend is not reachable",
+                "upstream backend is not reachable".to_string(),
                 None,
             ),
             Self::UpstreamError(_, message) => openai_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "upstream_error",
-                &message,
+                message,
                 None,
             ),
             Self::Cancelled => openai_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "request_cancelled",
-                "request was cancelled",
+                "request was cancelled".to_string(),
                 None,
             ),
             Self::EmbeddingsUnsupported => openai_error(
                 StatusCode::BAD_REQUEST,
                 "unsupported_embeddings",
-                "upstream backend does not support embeddings",
+                "upstream backend does not support embeddings".to_string(),
                 None,
             ),
         }
@@ -228,31 +229,6 @@ fn rewrite_model_alias(body: &str, alias: &str) -> String {
     }
 
     parts.join("\n")
-}
-
-
-fn openai_error(status: StatusCode, code: &str, message: &str, retry_after: Option<&str>) -> Response {
-    let mut response = (
-        status,
-        axum::Json(json!({
-            "error": {
-                "message": message,
-                "type": code,
-                "param": Value::Null,
-                "code": code,
-            }
-        })),
-    )
-        .into_response();
-
-    if let Some(retry_after) = retry_after {
-        response.headers_mut().insert(
-            axum::http::header::RETRY_AFTER,
-            retry_after.parse().expect("valid retry-after header"),
-        );
-    }
-
-    response
 }
 
 #[cfg(test)]
