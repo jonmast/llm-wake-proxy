@@ -233,7 +233,7 @@ fn warm_execution_error_response(error: WarmExecutionError) -> Response {
 #[cfg(test)]
 mod tests {
     use std::sync::{
-        Arc, RwLock,
+        Arc,
         atomic::{AtomicUsize, Ordering},
     };
 
@@ -343,10 +343,9 @@ mod tests {
         }
     }
 
-    fn state_with_lifecycle(decision: LifecycleDecision, backend: BackendStatus) -> AppState {
+    fn state_with_lifecycle(decision: LifecycleDecision) -> AppState {
         AppState::with_lifecycle(
             test_config(),
-            Arc::new(RwLock::new(backend)),
             Arc::new(StaticLifecycleOrchestrator { decision }),
         )
     }
@@ -373,13 +372,10 @@ mod tests {
             lifecycle: LifecycleState::Warming,
             ..BackendStatus::default()
         };
-        let state = state_with_lifecycle(
-            LifecycleDecision::Warming {
-                status: backend.clone(),
-                retry_after_secs: 7,
-            },
-            backend,
-        );
+        let state = state_with_lifecycle(LifecycleDecision::Warming {
+            status: backend,
+            retry_after_secs: 7,
+        });
 
         let response = Orchestrator::new(state.clone())
             .execute(LifecycleRequest::Chat, Bytes::new(), false)
@@ -401,13 +397,10 @@ mod tests {
             lifecycle: LifecycleState::Error,
             ..BackendStatus::default()
         };
-        let state = state_with_lifecycle(
-            LifecycleDecision::Failed {
-                status: backend.clone(),
-                error: LifecycleError::new("helper command failed"),
-            },
-            backend,
-        );
+        let state = state_with_lifecycle(LifecycleDecision::Failed {
+            status: backend,
+            error: LifecycleError::new("helper command failed"),
+        });
 
         let response = Orchestrator::new(state.clone())
             .execute(LifecycleRequest::Embeddings, Bytes::new(), false)
@@ -430,7 +423,6 @@ mod tests {
 
         let state = AppState::with_lifecycle(
             config,
-            Arc::new(RwLock::new(backend.clone())),
             Arc::new(StaticLifecycleOrchestrator {
                 decision: LifecycleDecision::Ready(backend),
             }),
@@ -463,7 +455,7 @@ mod tests {
             embeddings_reason: Some("remote disabled".to_string()),
             ..ready_status()
         };
-        let state = state_with_lifecycle(LifecycleDecision::Ready(backend.clone()), backend);
+        let state = state_with_lifecycle(LifecycleDecision::Ready(backend));
 
         let response = Orchestrator::new(state)
             .execute(LifecycleRequest::Embeddings, Bytes::new(), false)
@@ -494,7 +486,6 @@ mod tests {
         let backend = ready_status();
         let state = AppState::with_lifecycle(
             config,
-            Arc::new(RwLock::new(backend.clone())),
             Arc::new(StaticLifecycleOrchestrator {
                 decision: LifecycleDecision::Ready(backend),
             }),
@@ -524,7 +515,6 @@ mod tests {
         let backend = ready_status();
         let state = AppState::with_lifecycle(
             config,
-            Arc::new(RwLock::new(backend.clone())),
             Arc::new(StaticLifecycleOrchestrator {
                 decision: LifecycleDecision::Ready(backend),
             }),
@@ -557,7 +547,6 @@ mod tests {
         let backend = ready_status();
         let state = AppState::with_lifecycle(
             config,
-            Arc::new(RwLock::new(backend.clone())),
             Arc::new(StaticLifecycleOrchestrator {
                 decision: LifecycleDecision::Ready(backend),
             }),
@@ -584,7 +573,6 @@ mod tests {
         let backend = ready_status();
         let state = AppState::with_lifecycle(
             config,
-            Arc::new(RwLock::new(backend.clone())),
             Arc::new(StaticLifecycleOrchestrator {
                 decision: LifecycleDecision::Ready(backend),
             }),
@@ -615,7 +603,6 @@ mod tests {
 
         let state = AppState::with_lifecycle(
             config,
-            Arc::new(RwLock::new(backend.clone())),
             Arc::new(SequenceLifecycleOrchestrator::new(vec![
                 LifecycleDecision::Ready(backend.clone()),
                 LifecycleDecision::Warming {
@@ -647,7 +634,6 @@ mod tests {
 
         let state = AppState::with_lifecycle(
             config,
-            Arc::new(RwLock::new(backend.clone())),
             Arc::new(SequenceLifecycleOrchestrator::new(vec![
                 LifecycleDecision::Ready(backend.clone()),
                 LifecycleDecision::Failed {
@@ -684,7 +670,6 @@ mod tests {
 
         let state = AppState::with_lifecycle(
             config,
-            Arc::new(RwLock::new(ready.clone())),
             Arc::new(SequenceLifecycleOrchestrator::new(vec![
                 LifecycleDecision::Ready(ready),
                 LifecycleDecision::Ready(dropped),
@@ -731,7 +716,6 @@ mod tests {
 
         let state = AppState::with_services(
             config,
-            Arc::new(RwLock::new(backend.clone())),
             Arc::new(StaticLifecycleOrchestrator {
                 decision: LifecycleDecision::Ready(backend),
             }),
@@ -779,7 +763,6 @@ mod tests {
 
         let state = AppState::with_services(
             config,
-            Arc::new(RwLock::new(backend.clone())),
             Arc::new(StaticLifecycleOrchestrator {
                 decision: LifecycleDecision::Ready(backend),
             }),

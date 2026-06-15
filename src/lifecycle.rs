@@ -161,11 +161,6 @@ pub trait Clock: Send + Sync {
     fn now(&self) -> Timestamp;
 }
 
-pub trait BackendStatePublisher: Send + Sync {
-    fn snapshot(&self) -> BackendStatus;
-    fn publish(&self, status: BackendStatus);
-}
-
 pub trait LifecycleOrchestrator: Send + Sync {
     fn ensure_backend(&self, request: LifecycleRequest) -> LifecycleFuture<'_, LifecycleDecision>;
     fn status(&self) -> BackendStatus;
@@ -215,34 +210,30 @@ impl Default for BootstrapState {
     }
 }
 
-struct LifecycleCore<W, S, H, T, C, P> {
+struct LifecycleCore<W, S, H, T, C> {
     wake: W,
     ssh: S,
     helper: H,
     tunnel: T,
     clock: C,
-    state: P,
     timing: LifecycleTiming,
     bootstrap: Mutex<BootstrapState>,
     status_tx: watch::Sender<BackendStatus>,
 }
 
-pub struct LifecycleManager<W, S, H, T, C, P> {
-    core: Arc<LifecycleCore<W, S, H, T, C, P>>,
+pub struct LifecycleManager<W, S, H, T, C> {
+    core: Arc<LifecycleCore<W, S, H, T, C>>,
 }
 
-impl<W, S, H, T, C, P> LifecycleManager<W, S, H, T, C, P> {
-    pub fn new(wake: W, ssh: S, helper: H, tunnel: T, clock: C, state: P) -> Self
-    where
-        P: BackendStatePublisher,
-    {
+impl<W, S, H, T, C> LifecycleManager<W, S, H, T, C> {
+    pub fn new(wake: W, ssh: S, helper: H, tunnel: T, clock: C, initial_status: BackendStatus) -> Self {
         Self::new_with_timing(
             wake,
             ssh,
             helper,
             tunnel,
             clock,
-            state,
+            initial_status,
             LifecycleTiming::default(),
         )
     }
@@ -253,13 +244,9 @@ impl<W, S, H, T, C, P> LifecycleManager<W, S, H, T, C, P> {
         helper: H,
         tunnel: T,
         clock: C,
-        state: P,
+        initial_status: BackendStatus,
         timing: LifecycleTiming,
-    ) -> Self
-    where
-        P: BackendStatePublisher,
-    {
-        let initial_status = state.snapshot();
+    ) -> Self {
         let (status_tx, _) = watch::channel(initial_status);
 
         Self {
@@ -269,7 +256,6 @@ impl<W, S, H, T, C, P> LifecycleManager<W, S, H, T, C, P> {
                 helper,
                 tunnel,
                 clock,
-                state,
                 timing,
                 bootstrap: Mutex::new(BootstrapState::default()),
                 status_tx,
@@ -278,18 +264,16 @@ impl<W, S, H, T, C, P> LifecycleManager<W, S, H, T, C, P> {
     }
 }
 
-impl<W, S, H, T, C, P> LifecycleCore<W, S, H, T, C, P>
+impl<W, S, H, T, C> LifecycleCore<W, S, H, T, C>
 where
     W: WakeRequester + Send + Sync + 'static,
     S: SshReadinessProbe + Send + Sync + 'static,
     H: HelperRpc + Send + Sync + 'static,
     T: TunnelOwner + Send + Sync + 'static,
     C: Clock + Send + Sync + 'static,
-    P: BackendStatePublisher + Send + Sync + 'static,
 {
     fn publish(&self, status: BackendStatus) {
-        self.state.publish(status.clone());
-        let _ = self.status_tx.send(status);
+        self.status_tx.send_replace(status);
     }
 
     async fn start_or_join_bootstrap(
@@ -436,8 +420,8 @@ where
     fn bootstrap_deadline(&self) -> Instant {
         let now = self.clock.now().unix_seconds();
         let wake_started_at = self
-            .state
-            .snapshot()
+            .status_tx
+            .borrow()
             .last_wake_attempt_at
             .map(Timestamp::unix_seconds)
             .unwrap_or(now);
@@ -454,7 +438,7 @@ where
             if Instant::now() >= deadline {
                 let error =
                     LifecycleError::new("backend did not become ready before the boot deadline");
-                let mut status = self.state.snapshot();
+                let mut status = self.status_tx.borrow().clone();
                 status.lifecycle = LifecycleState::Error;
                 status.tunnel = TunnelState::Down;
                 self.finish_bootstrap(status, Some(error)).await;
@@ -468,14 +452,14 @@ where
             if Instant::now() >= deadline {
                 let error =
                     LifecycleError::new("backend did not become ready before the boot deadline");
-                let mut status = self.state.snapshot();
+                let mut status = self.status_tx.borrow().clone();
                 status.lifecycle = LifecycleState::Error;
                 status.tunnel = TunnelState::Down;
                 self.finish_bootstrap(status, Some(error)).await;
                 return;
             }
 
-            let status = self.state.snapshot();
+            let status = self.status_tx.borrow().clone();
 
             let observe_request = self.bootstrap_observe_request().await;
 
@@ -538,7 +522,10 @@ where
                 Ok(Ok(())) => {}
                 Ok(Err(_)) | Err(_) => {
                     return LifecycleDecision::Warming {
-                        status: bootstrap_wait_status(self.state.snapshot(), stale_bootstrap_view),
+                        status: bootstrap_wait_status(
+                            self.status_tx.borrow().clone(),
+                            stale_bootstrap_view,
+                        ),
                         retry_after_secs: self.timing.retry_after_secs,
                     };
                 }
@@ -547,18 +534,17 @@ where
     }
 }
 
-impl<W, S, H, T, C, P> LifecycleOrchestrator for LifecycleManager<W, S, H, T, C, P>
+impl<W, S, H, T, C> LifecycleOrchestrator for LifecycleManager<W, S, H, T, C>
 where
     W: WakeRequester + Send + Sync + 'static,
     S: SshReadinessProbe + Send + Sync + 'static,
     H: HelperRpc + Send + Sync + 'static,
     T: TunnelOwner + Send + Sync + 'static,
     C: Clock + Send + Sync + 'static,
-    P: BackendStatePublisher + Send + Sync + 'static,
 {
     fn ensure_backend(&self, request: LifecycleRequest) -> LifecycleFuture<'_, LifecycleDecision> {
         Box::pin(async move {
-            let initial_status = self.core.state.snapshot();
+            let initial_status = self.core.status_tx.borrow().clone();
             let bootstrap_active = self.core.bootstrap.lock().await.active;
 
             if !bootstrap_active && backend_is_ready(&initial_status) {
@@ -578,9 +564,8 @@ where
                     .await
                 {
                     ready @ LifecycleDecision::Ready(_) => {
-                        self.core
-                            .finish_bootstrap(self.core.state.snapshot(), None)
-                            .await;
+                        let status = self.core.status_tx.borrow().clone();
+                        self.core.finish_bootstrap(status, None).await;
                         return ready;
                     }
                     LifecycleDecision::Failed { status, error } => {
@@ -603,12 +588,12 @@ where
     }
 
     fn status(&self) -> BackendStatus {
-        self.core.state.snapshot()
+        self.core.status_tx.borrow().clone()
     }
 
     fn degrade_embeddings(&self, reason: String) -> LifecycleFuture<'_, ()> {
         Box::pin(async move {
-            let mut status = self.core.state.snapshot();
+            let mut status = self.core.status_tx.borrow().clone();
             status.embeddings = CapabilityState::Degraded;
             status.embeddings_reason = Some(reason);
             self.core.publish(status);
@@ -616,7 +601,7 @@ where
     }
 
     fn mark_warming(&self) {
-        let mut status = self.core.state.snapshot();
+        let mut status = self.core.status_tx.borrow().clone();
         status.lifecycle = LifecycleState::Warming;
         status.tunnel = TunnelState::Down;
         self.core.publish(status);
@@ -854,38 +839,10 @@ mod tests {
         }
     }
 
-    #[derive(Clone)]
-    struct FakeBackendStatePublisher {
-        status: Arc<Mutex<BackendStatus>>,
-    }
-
-    impl FakeBackendStatePublisher {
-        fn new(status: BackendStatus) -> Self {
-            Self {
-                status: Arc::new(Mutex::new(status)),
-            }
-        }
-
-        fn latest(&self) -> BackendStatus {
-            self.status.lock().unwrap().clone()
-        }
-    }
-
-    impl BackendStatePublisher for FakeBackendStatePublisher {
-        fn snapshot(&self) -> BackendStatus {
-            self.latest()
-        }
-
-        fn publish(&self, status: BackendStatus) {
-            *self.status.lock().unwrap() = status;
-        }
-    }
-
     #[tokio::test]
     async fn cold_request_marks_backend_warming_using_only_fakes() {
         let wake = FakeWakeRequester::default();
         let helper = FakeHelperRpc::default();
-        let state = FakeBackendStatePublisher::new(BackendStatus::default());
         let lifecycle = LifecycleManager::new_with_timing(
             wake,
             FakeSshReadinessProbe::new(false),
@@ -894,7 +851,7 @@ mod tests {
             FakeClock {
                 now: Timestamp::new(FAKE_NOW),
             },
-            state.clone(),
+            BackendStatus::default(),
             fast_warming_timing(),
         );
 
@@ -912,14 +869,13 @@ mod tests {
             other => panic!("expected warming decision, got {other:?}"),
         }
 
-        let latest = state.latest();
+        let latest = lifecycle.status();
         assert_eq!(latest.lifecycle, LifecycleState::Warming);
         assert_eq!(latest.last_wake_attempt_at, Some(Timestamp::new(FAKE_NOW)));
     }
 
     #[tokio::test]
     async fn ready_backend_can_be_reached_with_fake_ports_only() {
-        let state = FakeBackendStatePublisher::new(BackendStatus::default());
         let lifecycle = LifecycleManager::new(
             FakeWakeRequester::default(),
             FakeSshReadinessProbe::new(true),
@@ -928,7 +884,7 @@ mod tests {
             FakeClock {
                 now: Timestamp::new(FAKE_NOW),
             },
-            state.clone(),
+            BackendStatus::default(),
         );
 
         let decision = lifecycle.ensure_backend(LifecycleRequest::Embeddings).await;
@@ -943,14 +899,13 @@ mod tests {
             other => panic!("expected ready decision, got {other:?}"),
         }
 
-        let latest = state.latest();
+        let latest = lifecycle.status();
         assert_eq!(latest.lifecycle, LifecycleState::Ready);
         assert_eq!(latest.tunnel, TunnelState::Ready);
     }
 
     #[tokio::test]
     async fn wake_failures_publish_error_without_touching_real_dependencies() {
-        let state = FakeBackendStatePublisher::new(BackendStatus::default());
         let lifecycle = LifecycleManager::new(
             FakeWakeRequester::with_error("wake failed"),
             FakeSshReadinessProbe::new(false),
@@ -959,7 +914,7 @@ mod tests {
             FakeClock {
                 now: Timestamp::new(FAKE_NOW),
             },
-            state.clone(),
+            BackendStatus::default(),
         );
 
         let decision = lifecycle.ensure_backend(LifecycleRequest::Chat).await;
@@ -973,7 +928,7 @@ mod tests {
             other => panic!("expected failed decision, got {other:?}"),
         }
 
-        let latest = state.latest();
+        let latest = lifecycle.status();
         assert_eq!(latest.lifecycle, LifecycleState::Error);
         assert_eq!(latest.last_wake_attempt_at, Some(Timestamp::new(FAKE_NOW)));
     }
@@ -991,7 +946,7 @@ mod tests {
             FakeClock {
                 now: Timestamp::new(FAKE_NOW),
             },
-            FakeBackendStatePublisher::new(BackendStatus::default()),
+            BackendStatus::default(),
             LifecycleTiming {
                 cold_wait_budget_secs: 1,
                 hard_boot_deadline_secs: 1,
@@ -1030,7 +985,7 @@ mod tests {
         assert_eq!(wake.requests(), vec![LifecycleRequest::Chat]);
         assert_eq!(helper.call_count(), 1);
         assert_eq!(helper.requests(), vec![LifecycleRequest::Embeddings]);
-        assert_eq!(lifecycle.core.state.snapshot().tunnel, TunnelState::Ready);
+        assert_eq!(lifecycle.status().tunnel, TunnelState::Ready);
     }
 
     #[tokio::test]
@@ -1046,7 +1001,7 @@ mod tests {
             FakeClock {
                 now: Timestamp::new(FAKE_NOW),
             },
-            FakeBackendStatePublisher::new(BackendStatus::default()),
+            BackendStatus::default(),
             LifecycleTiming {
                 cold_wait_budget_secs: 1,
                 hard_boot_deadline_secs: 1,
@@ -1087,7 +1042,6 @@ mod tests {
 
     #[tokio::test]
     async fn helper_reported_error_returns_failed_decision() {
-        let state = FakeBackendStatePublisher::new(BackendStatus::default());
         let lifecycle = LifecycleManager::new(
             FakeWakeRequester::default(),
             FakeSshReadinessProbe::new(true),
@@ -1096,7 +1050,7 @@ mod tests {
             FakeClock {
                 now: Timestamp::new(FAKE_NOW),
             },
-            state.clone(),
+            BackendStatus::default(),
         );
 
         let decision = lifecycle.ensure_backend(LifecycleRequest::Chat).await;
@@ -1110,7 +1064,7 @@ mod tests {
             other => panic!("expected failed decision, got {other:?}"),
         }
 
-        let latest = state.latest();
+        let latest = lifecycle.status();
         assert_eq!(latest.lifecycle, LifecycleState::Error);
         assert_eq!(latest.tunnel, TunnelState::Down);
     }
@@ -1118,11 +1072,11 @@ mod tests {
     #[tokio::test]
     async fn ssh_not_ready_republishes_warming_state_from_ready_snapshot() {
         let wake = FakeWakeRequester::default();
-        let state = FakeBackendStatePublisher::new(BackendStatus {
+        let initial_status = BackendStatus {
             lifecycle: LifecycleState::Ready,
             tunnel: TunnelState::Ready,
             ..BackendStatus::default()
-        });
+        };
         let lifecycle = LifecycleManager::new_with_timing(
             wake.clone(),
             FakeSshReadinessProbe::new(false),
@@ -1131,7 +1085,7 @@ mod tests {
             FakeClock {
                 now: Timestamp::new(FAKE_NOW),
             },
-            state.clone(),
+            initial_status,
             fast_warming_timing(),
         );
 
@@ -1145,7 +1099,7 @@ mod tests {
             other => panic!("expected ready decision, got {other:?}"),
         }
 
-        let latest = state.latest();
+        let latest = lifecycle.status();
         assert_eq!(latest.lifecycle, LifecycleState::Ready);
         assert_eq!(latest.tunnel, TunnelState::Ready);
         assert_eq!(wake.call_count(), 0);
@@ -1154,11 +1108,11 @@ mod tests {
     #[tokio::test]
     async fn error_snapshot_retries_wake_when_ssh_is_not_ready() {
         let wake = FakeWakeRequester::default();
-        let state = FakeBackendStatePublisher::new(BackendStatus {
+        let initial_status = BackendStatus {
             lifecycle: LifecycleState::Error,
             tunnel: TunnelState::Down,
             ..BackendStatus::default()
-        });
+        };
         let lifecycle = LifecycleManager::new_with_timing(
             wake.clone(),
             FakeSshReadinessProbe::new(false),
@@ -1167,7 +1121,7 @@ mod tests {
             FakeClock {
                 now: Timestamp::new(FAKE_NOW),
             },
-            state.clone(),
+            initial_status,
             fast_warming_timing(),
         );
 
@@ -1181,7 +1135,7 @@ mod tests {
             other => panic!("expected warming decision, got {other:?}"),
         }
 
-        assert_eq!(state.latest().lifecycle, LifecycleState::Warming);
+        assert_eq!(lifecycle.status().lifecycle, LifecycleState::Warming);
         assert_eq!(wake.call_count(), 1);
     }
 
@@ -1190,11 +1144,11 @@ mod tests {
         let wake = FakeWakeRequester::default();
         let helper = FakeHelperRpc::ready();
         let tunnel = FakeTunnelOwner::new(TunnelState::Ready);
-        let state = FakeBackendStatePublisher::new(BackendStatus {
+        let initial_status = BackendStatus {
             lifecycle: LifecycleState::Ready,
             tunnel: TunnelState::Ready,
             ..BackendStatus::default()
-        });
+        };
         let lifecycle = LifecycleManager::new(
             wake.clone(),
             FakeSshReadinessProbe::new(true),
@@ -1203,7 +1157,7 @@ mod tests {
             FakeClock {
                 now: Timestamp::new(FAKE_NOW),
             },
-            state.clone(),
+            initial_status,
         );
 
         let decision = lifecycle.ensure_backend(LifecycleRequest::Chat).await;
@@ -1219,7 +1173,7 @@ mod tests {
         assert_eq!(wake.call_count(), 0);
         assert_eq!(helper.call_count(), 0);
         assert_eq!(tunnel.call_count(), 0);
-        assert_eq!(state.latest().lifecycle, LifecycleState::Ready);
+        assert_eq!(lifecycle.status().lifecycle, LifecycleState::Ready);
     }
 
     #[tokio::test]
@@ -1235,11 +1189,11 @@ mod tests {
             FakeClock {
                 now: Timestamp::new(FAKE_NOW),
             },
-            FakeBackendStatePublisher::new(BackendStatus {
+            BackendStatus {
                 lifecycle: LifecycleState::Ready,
                 tunnel: TunnelState::Ready,
                 ..BackendStatus::default()
-            }),
+            },
         ));
 
         let (first, second) = tokio::join!(
@@ -1259,7 +1213,6 @@ mod tests {
         let wake = FakeWakeRequester::default();
         let helper = FakeHelperRpc::ready();
         let tunnel = FakeTunnelOwner::new(TunnelState::Ready);
-        let state = FakeBackendStatePublisher::new(BackendStatus::default());
         let lifecycle = LifecycleManager::new(
             wake.clone(),
             FakeSshReadinessProbe::new(true),
@@ -1268,7 +1221,7 @@ mod tests {
             FakeClock {
                 now: Timestamp::new(FAKE_NOW),
             },
-            state.clone(),
+            BackendStatus::default(),
         );
 
         let decision = lifecycle.ensure_backend(LifecycleRequest::Chat).await;
@@ -1285,7 +1238,7 @@ mod tests {
 
         assert_eq!(wake.call_count(), 0);
         assert_eq!(tunnel.call_count(), 1);
-        assert_eq!(state.latest().lifecycle, LifecycleState::Ready);
+        assert_eq!(lifecycle.status().lifecycle, LifecycleState::Ready);
     }
 
     #[tokio::test]
@@ -1293,7 +1246,6 @@ mod tests {
         let wake = FakeWakeRequester::default();
         let ssh = FakeSshReadinessProbe::new(false);
         let helper = FakeHelperRpc::default();
-        let state = FakeBackendStatePublisher::new(BackendStatus::default());
         let lifecycle = LifecycleManager::new_with_timing(
             wake.clone(),
             ssh.clone(),
@@ -1302,7 +1254,7 @@ mod tests {
             FakeClock {
                 now: Timestamp::new(FAKE_NOW),
             },
-            state.clone(),
+            BackendStatus::default(),
             fast_warming_timing(),
         );
 
@@ -1322,7 +1274,7 @@ mod tests {
 
         sleep(Duration::from_millis(30)).await;
 
-        let latest = state.latest();
+        let latest = lifecycle.status();
         assert_eq!(latest.lifecycle, LifecycleState::Ready);
         assert_eq!(latest.tunnel, TunnelState::Ready);
         assert_eq!(wake.call_count(), 1);
@@ -1330,7 +1282,6 @@ mod tests {
 
     #[tokio::test]
     async fn background_bootstrap_fails_at_hard_deadline_after_request_timeout() {
-        let state = FakeBackendStatePublisher::new(BackendStatus::default());
         let lifecycle = LifecycleManager::new_with_timing(
             FakeWakeRequester::default(),
             FakeSshReadinessProbe::new(false),
@@ -1339,7 +1290,7 @@ mod tests {
             FakeClock {
                 now: Timestamp::new(FAKE_NOW),
             },
-            state.clone(),
+            BackendStatus::default(),
             LifecycleTiming {
                 cold_wait_budget_secs: 0,
                 hard_boot_deadline_secs: 0,
@@ -1353,7 +1304,7 @@ mod tests {
 
         sleep(Duration::from_millis(20)).await;
 
-        let latest = state.latest();
+        let latest = lifecycle.status();
         assert_eq!(latest.lifecycle, LifecycleState::Error);
         assert_eq!(latest.tunnel, TunnelState::Down);
     }
@@ -1370,11 +1321,11 @@ mod tests {
             FakeClock {
                 now: Timestamp::new(FAKE_NOW),
             },
-            FakeBackendStatePublisher::new(BackendStatus {
+            BackendStatus {
                 lifecycle: LifecycleState::Ready,
                 tunnel: TunnelState::Ready,
                 ..BackendStatus::default()
-            }),
+            },
             fast_warming_timing(),
         ));
 
@@ -1400,11 +1351,11 @@ mod tests {
             FakeClock {
                 now: Timestamp::new(FAKE_NOW),
             },
-            FakeBackendStatePublisher::new(BackendStatus {
+            BackendStatus {
                 lifecycle: LifecycleState::Error,
                 tunnel: TunnelState::Down,
                 ..BackendStatus::default()
-            }),
+            },
             fast_warming_timing(),
         ));
 
@@ -1428,7 +1379,7 @@ mod tests {
             FakeClock {
                 now: Timestamp::new(FAKE_NOW),
             },
-            FakeBackendStatePublisher::new(BackendStatus::default()),
+            BackendStatus::default(),
             LifecycleTiming {
                 cold_wait_budget_secs: 1,
                 hard_boot_deadline_secs: 0,

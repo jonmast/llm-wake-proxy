@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        Arc, RwLock,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -12,10 +12,9 @@ use crate::{
     config::AppConfig,
     host::{SshHelperRpc, SshTcpProbe, SshTunnelManager, WolWakeRequester},
     lifecycle::{
-        BackendStatePublisher, BackendStatus, Clock, HelperRpc, LifecycleError, LifecycleFuture,
-        LifecycleManager, LifecycleOrchestrator, LifecycleRequest, LifecycleState,
-        ObservedBackendState, SshReadinessProbe, Timestamp, TunnelOwner, TunnelState,
-        WakeRequester,
+        BackendStatus, Clock, HelperRpc, LifecycleError, LifecycleFuture, LifecycleManager,
+        LifecycleOrchestrator, LifecycleRequest, LifecycleState, ObservedBackendState,
+        SshReadinessProbe, Timestamp, TunnelOwner, TunnelState, WakeRequester,
     },
     metrics::Metrics,
     scheduler::WarmExecutionScheduler,
@@ -24,7 +23,6 @@ use crate::{
 #[derive(Clone)]
 pub struct AppState {
     pub config: AppConfig,
-    pub backend: Arc<RwLock<BackendStatus>>,
     pub lifecycle: Arc<dyn LifecycleOrchestrator>,
     pub scheduler: WarmExecutionScheduler,
     pub metrics: Arc<Metrics>,
@@ -42,16 +40,12 @@ impl AppState {
     }
 
     pub fn is_cold(&self) -> bool {
-        matches!(
-            self.backend.read().expect("backend state lock poisoned").lifecycle,
-            LifecycleState::Cold
-        )
+        matches!(self.lifecycle.status().lifecycle, LifecycleState::Cold)
     }
 }
 
 impl AppState {
     pub fn new(config: AppConfig) -> Self {
-        let backend = Arc::new(RwLock::new(BackendStatus::default()));
         let cold_start_max = config.cold_start_max_waiting;
         let lifecycle = Arc::new(LifecycleManager::new(
             NoopWakeRequester,
@@ -59,13 +53,12 @@ impl AppState {
             NoopHelperRpc,
             NoopTunnelOwner,
             SystemClock,
-            SharedBackendState::new(backend.clone()),
+            BackendStatus::default(),
         ));
         let scheduler = WarmExecutionScheduler::new(config.warm_execution.clone());
 
         Self {
             config,
-            backend,
             lifecycle,
             scheduler,
             metrics: Arc::new(Metrics::default()),
@@ -75,7 +68,6 @@ impl AppState {
     }
 
     pub fn production(config: AppConfig) -> Self {
-        let backend = Arc::new(RwLock::new(BackendStatus::default()));
         let cold_start_max = config.cold_start_max_waiting;
 
         let wake = WolWakeRequester::new(
@@ -106,13 +98,12 @@ impl AppState {
             helper,
             tunnel,
             SystemClock,
-            SharedBackendState::new(backend.clone()),
+            BackendStatus::default(),
         ));
         let scheduler = WarmExecutionScheduler::new(config.warm_execution.clone());
 
         Self {
             config,
-            backend,
             lifecycle,
             scheduler,
             metrics: Arc::new(Metrics::default()),
@@ -122,57 +113,27 @@ impl AppState {
     }
 
     #[cfg(test)]
-    pub fn with_lifecycle(
-        config: AppConfig,
-        backend: Arc<RwLock<BackendStatus>>,
-        lifecycle: Arc<dyn LifecycleOrchestrator>,
-    ) -> Self {
+    pub fn with_lifecycle(config: AppConfig, lifecycle: Arc<dyn LifecycleOrchestrator>) -> Self {
         let scheduler = WarmExecutionScheduler::new(config.warm_execution.clone());
 
-        Self::with_services(config, backend, lifecycle, scheduler)
+        Self::with_services(config, lifecycle, scheduler)
     }
 
     #[cfg(test)]
     pub fn with_services(
         config: AppConfig,
-        backend: Arc<RwLock<BackendStatus>>,
         lifecycle: Arc<dyn LifecycleOrchestrator>,
         scheduler: WarmExecutionScheduler,
     ) -> Self {
         let cold_start_max = config.cold_start_max_waiting;
         Self {
             config,
-            backend,
             lifecycle,
             scheduler,
             metrics: Arc::new(Metrics::default()),
             prev_tunnel_was_ready: Arc::new(AtomicBool::new(false)),
             cold_start_semaphore: Arc::new(Semaphore::new(cold_start_max)),
         }
-    }
-}
-
-#[derive(Clone)]
-struct SharedBackendState {
-    backend: Arc<RwLock<BackendStatus>>,
-}
-
-impl SharedBackendState {
-    fn new(backend: Arc<RwLock<BackendStatus>>) -> Self {
-        Self { backend }
-    }
-}
-
-impl BackendStatePublisher for SharedBackendState {
-    fn snapshot(&self) -> BackendStatus {
-        self.backend
-            .read()
-            .expect("backend state lock poisoned")
-            .clone()
-    }
-
-    fn publish(&self, status: BackendStatus) {
-        *self.backend.write().expect("backend state lock poisoned") = status;
     }
 }
 

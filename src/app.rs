@@ -454,7 +454,7 @@ struct EmbeddingsRequest {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, RwLock};
+    use std::sync::Arc;
 
     use axum::{
         body::Body,
@@ -527,10 +527,9 @@ mod tests {
         AppState::new(test_config())
     }
 
-    fn state_with_lifecycle(decision: LifecycleDecision, backend: BackendStatus) -> AppState {
+    fn state_with_lifecycle(decision: LifecycleDecision) -> AppState {
         AppState::with_lifecycle(
             test_config(),
-            Arc::new(RwLock::new(backend)),
             Arc::new(StaticLifecycleOrchestrator { decision }),
         )
     }
@@ -559,8 +558,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let backend = state.backend.read().unwrap();
-        assert!(matches!(backend.lifecycle, LifecycleState::Cold));
+        let status = state.lifecycle.status();
+        assert!(matches!(status.lifecycle, LifecycleState::Cold));
     }
 
     #[tokio::test]
@@ -649,10 +648,9 @@ mod tests {
         };
         let app = build_router(state_with_lifecycle(
             LifecycleDecision::Warming {
-                status: warming_status.clone(),
+                status: warming_status,
                 retry_after_secs: 10,
             },
-            warming_status,
         ));
 
         let response = app
@@ -701,10 +699,9 @@ mod tests {
         };
         let app = build_router(state_with_lifecycle(
             LifecycleDecision::Warming {
-                status: warming_status.clone(),
+                status: warming_status,
                 retry_after_secs: 10,
             },
-            warming_status,
         ));
 
         let response = app
@@ -732,10 +729,9 @@ mod tests {
         };
         let app = build_router(state_with_lifecycle(
             LifecycleDecision::Warming {
-                status: warming_status.clone(),
+                status: warming_status,
                 retry_after_secs: 10,
             },
-            warming_status,
         ));
 
         let response = app
@@ -1050,10 +1046,9 @@ mod tests {
         };
         let app = build_router(state_with_lifecycle(
             LifecycleDecision::Warming {
-                status: warming_status.clone(),
+                status: warming_status,
                 retry_after_secs: 10,
             },
-            warming_status,
         ));
 
         let response = app
@@ -1078,10 +1073,7 @@ mod tests {
             tunnel: TunnelState::Ready,
             ..BackendStatus::default()
         };
-        let app = build_router(state_with_lifecycle(
-            LifecycleDecision::Ready(ready_status.clone()),
-            ready_status,
-        ));
+        let app = build_router(state_with_lifecycle(LifecycleDecision::Ready(ready_status)));
 
         let response = app
             .oneshot(
@@ -1108,13 +1100,10 @@ mod tests {
             lifecycle: LifecycleState::Error,
             ..BackendStatus::default()
         };
-        let app = build_router(state_with_lifecycle(
-            LifecycleDecision::Failed {
-                status: failed_status.clone(),
-                error: LifecycleError::new("helper command failed"),
-            },
-            failed_status,
-        ));
+        let app = build_router(state_with_lifecycle(LifecycleDecision::Failed {
+            status: failed_status,
+            error: LifecycleError::new("helper command failed"),
+        }));
 
         let response = app
             .oneshot(
@@ -1165,13 +1154,10 @@ mod tests {
             llama_server_unit: UnitState::Active,
             inhibit_unit: UnitState::Activating,
         };
-        let app = build_router(state_with_lifecycle(
-            LifecycleDecision::Warming {
-                status: backend.clone(),
-                retry_after_secs: 10,
-            },
-            backend,
-        ));
+        let app = build_router(state_with_lifecycle(LifecycleDecision::Warming {
+            status: backend,
+            retry_after_secs: 10,
+        }));
 
         let response = app
             .oneshot(Request::get("/status").body(Body::empty()).unwrap())
@@ -1193,21 +1179,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_reads_from_orchestrator_snapshot_not_backend_lock() {
-        let app = build_router(state_with_lifecycle(
-            LifecycleDecision::Warming {
-                status: BackendStatus {
-                    lifecycle: LifecycleState::Warming,
-                    tunnel: TunnelState::Connecting,
-                    ..BackendStatus::default()
-                },
-                retry_after_secs: 10,
-            },
-            BackendStatus {
-                lifecycle: LifecycleState::Cold,
+    async fn status_reflects_orchestrator_snapshot() {
+        let app = build_router(state_with_lifecycle(LifecycleDecision::Warming {
+            status: BackendStatus {
+                lifecycle: LifecycleState::Warming,
+                tunnel: TunnelState::Connecting,
                 ..BackendStatus::default()
             },
-        ));
+            retry_after_secs: 10,
+        }));
 
         let response = app
             .oneshot(Request::get("/status").body(Body::empty()).unwrap())
@@ -1253,7 +1233,6 @@ mod tests {
 
         let app = build_router(AppState::with_services(
             config,
-            Arc::new(RwLock::new(ready_status.clone())),
             Arc::new(StaticLifecycleOrchestrator {
                 decision: LifecycleDecision::Ready(ready_status),
             }),
@@ -1315,7 +1294,6 @@ mod tests {
 
         let app = build_router(AppState::with_services(
             config,
-            Arc::new(RwLock::new(ready_status.clone())),
             Arc::new(StaticLifecycleOrchestrator {
                 decision: LifecycleDecision::Ready(ready_status),
             }),
@@ -1375,7 +1353,6 @@ mod tests {
 
         let app = build_router(AppState::with_services(
             config,
-            Arc::new(RwLock::new(ready_status.clone())),
             Arc::new(StaticLifecycleOrchestrator {
                 decision: LifecycleDecision::Ready(ready_status),
             }),
