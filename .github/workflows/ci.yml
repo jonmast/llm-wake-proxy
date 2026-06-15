@@ -38,5 +38,8 @@ jobs:
 
       - uses: azure/setup-helm@v4
 
+      - name: add chart repos
+        run: helm repo add bjw-s-labs https://bjw-s-labs.github.io/helm-charts
+
       - name: helm lint
         run: make helm-lint
