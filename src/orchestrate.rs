@@ -21,7 +21,7 @@ impl Orchestrator {
     pub async fn execute(&self, kind: LifecycleRequest, body: Bytes, stream: bool) -> Response {
         let _cold_permit = match self.acquire_cold_permit() {
             Ok(permit) => permit,
-            Err(response) => return response,
+            Err(response) => return *response,
         };
 
         match self.state.lifecycle.ensure_backend(kind.clone()).await {
@@ -50,16 +50,16 @@ impl Orchestrator {
         }
     }
 
-    fn acquire_cold_permit(&self) -> Result<Option<OwnedSemaphorePermit>, Response> {
+    fn acquire_cold_permit(&self) -> Result<Option<OwnedSemaphorePermit>, Box<Response>> {
         if self.state.is_cold() {
             match self.state.cold_start_semaphore.clone().try_acquire_owned() {
                 Ok(permit) => Ok(Some(permit)),
-                Err(_) => Err(openai_error(
+                Err(_) => Err(Box::new(openai_error(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "warming_up",
                     "cold-start queue is full, retry later".to_string(),
                     Some("10"),
-                )),
+                ))),
             }
         } else {
             Ok(None)

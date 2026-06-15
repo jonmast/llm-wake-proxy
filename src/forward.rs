@@ -175,8 +175,8 @@ fn rewrite_model_alias(body: &str, alias: &str) -> String {
 
     let mut parts = Vec::new();
     for part in body.split('\n') {
-        let (clean_part, has_r) = if part.ends_with('\r') {
-            (&part[..part.len() - 1], true)
+        let (clean_part, has_r) = if let Some(stripped) = part.strip_suffix('\r') {
+            (stripped, true)
         } else {
             (part, false)
         };
@@ -185,11 +185,10 @@ fn rewrite_model_alias(body: &str, alias: &str) -> String {
             if sse_data.contains("\"model\"") {
                 match serde_json::from_str::<Value>(sse_data) {
                     Ok(mut value) => {
-                        if let Some(obj) = value.as_object_mut() {
-                            if let Some(model) = obj.get_mut("model") {
+                        if let Some(obj) = value.as_object_mut()
+                            && let Some(model) = obj.get_mut("model") {
                                 *model = Value::String(alias.to_string());
                             }
-                        }
                         if let Ok(rewritten) = serde_json::to_string(&value) {
                             format!("data: {rewritten}")
                         } else {
@@ -204,11 +203,10 @@ fn rewrite_model_alias(body: &str, alias: &str) -> String {
         } else if clean_part.contains("\"model\"") {
             match serde_json::from_str::<Value>(clean_part) {
                 Ok(mut value) => {
-                    if let Some(obj) = value.as_object_mut() {
-                        if let Some(model) = obj.get_mut("model") {
+                    if let Some(obj) = value.as_object_mut()
+                        && let Some(model) = obj.get_mut("model") {
                             *model = Value::String(alias.to_string());
                         }
-                    }
                     if let Ok(rewritten) = serde_json::to_string(&value) {
                         rewritten
                     } else {

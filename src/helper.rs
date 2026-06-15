@@ -838,9 +838,9 @@ mod tests {
         let response = helper.ensure_started("llama-3.2-3b", "/models/llama-3.2-3b.Q4_K_M.gguf");
 
         assert_eq!(response.status, HelperStatus::Ok);
-        assert_eq!(response.startup_triggered, false);
-        assert_eq!(response.server_ready, true);
-        assert_eq!(response.model_verified, true);
+        assert!(!response.startup_triggered);
+        assert!(response.server_ready);
+        assert!(response.model_verified);
         assert_eq!(response.message, "model is already running and ready");
     }
 
@@ -918,9 +918,9 @@ mod tests {
         let response = helper.ensure_started("llama-3.2-3b", "/models/llama-3.2-3b.Q4_K_M.gguf");
 
         assert_eq!(response.status, HelperStatus::Ok);
-        assert_eq!(response.startup_triggered, true);
-        assert_eq!(response.server_ready, true);
-        assert_eq!(response.model_verified, true);
+        assert!(response.startup_triggered);
+        assert!(response.server_ready);
+        assert!(response.model_verified);
         assert_eq!(response.message, "model started and verified successfully");
     }
 
@@ -966,8 +966,8 @@ mod tests {
         let response = helper.ensure_started("llama-3.2-3b", "/models/llama-3.2-3b.Q4_K_M.gguf");
 
         assert_eq!(response.status, HelperStatus::Mismatch);
-        assert_eq!(response.server_ready, true);
-        assert_eq!(response.model_verified, false);
+        assert!(response.server_ready);
+        assert!(!response.model_verified);
         assert!(response.message.contains("mismatch") || response.message.contains("expected"));
     }
 
@@ -1007,8 +1007,8 @@ mod tests {
         let response = helper.ensure_started("test-model", "/models/test.gguf");
 
         assert_eq!(response.status, HelperStatus::Error);
-        assert_eq!(response.startup_triggered, false);
-        assert_eq!(response.server_ready, false);
+        assert!(!response.startup_triggered);
+        assert!(!response.server_ready);
         assert!(response.message.contains("failed to start"));
     }
 
@@ -1051,7 +1051,7 @@ mod tests {
         let response = helper.ensure_started("test-model", "/models/test.gguf");
 
         assert_eq!(response.status, HelperStatus::Error);
-        assert_eq!(response.server_ready, false);
+        assert!(!response.server_ready);
         assert!(response.message.contains("did not become ready"));
     }
 
@@ -1185,7 +1185,7 @@ mod tests {
         assert_eq!(response.status, HelperStatus::Ok);
         assert_eq!(response.message, "lease acquired");
         assert_eq!(response.ttl_secs, 900);
-        assert_eq!(response.renewed, false);
+        assert!(!response.renewed);
     }
 
     #[test]
@@ -1233,7 +1233,7 @@ mod tests {
 
         assert_eq!(response.status, HelperStatus::Ok);
         assert_eq!(response.message, "lease renewed");
-        assert_eq!(response.renewed, true);
+        assert!(response.renewed);
     }
 
     #[test]
@@ -1281,7 +1281,7 @@ mod tests {
 
         assert_eq!(response.status, HelperStatus::Error);
         assert!(response.message.contains("systemd-run"));
-        assert_eq!(response.renewed, false);
+        assert!(!response.renewed);
     }
 
     #[test]

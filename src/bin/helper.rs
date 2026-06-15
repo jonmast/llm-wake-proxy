@@ -58,7 +58,7 @@ fn main() -> ExitCode {
                 Some(alias) => alias,
                 None => {
                     eprintln!("Usage: helper ensure-started <model-alias>");
-                    eprintln!("");
+                    eprintln!();
                     eprintln!("Environment:");
                     eprintln!("  EXPECTED_MODEL_PATH    Path to verify against running server");
                     eprintln!("  LLAMA_SERVER_UNIT      systemd unit name (default: llama-server)");
@@ -117,11 +117,11 @@ fn main() -> ExitCode {
                 }
                 _ => {
                     eprintln!("Usage: helper lease <acquire|release|inspect>");
-                    eprintln!("");
+                    eprintln!();
                     eprintln!("  acquire [--ttl <secs>]    Create or renew inhibit lease");
                     eprintln!("  release                  Stop inhibit lease");
                     eprintln!("  inspect                  Show current lease state");
-                    eprintln!("");
+                    eprintln!();
                     eprintln!("Environment:");
                     eprintln!("  INHIBIT_HOLDER_UNIT    systemd unit name (default: llm-wake-proxy-inhibit)");
                     ExitCode::FAILURE
@@ -133,7 +133,7 @@ fn main() -> ExitCode {
             eprintln!("  helper status                    Show host unit and model status");
             eprintln!("  helper ensure-started <alias>    Start and verify model server");
             eprintln!("  helper lease <acquire|release|inspect>  Manage inhibit lease");
-            eprintln!("");
+            eprintln!();
             eprintln!("Environment:");
             eprintln!("  EXPECTED_MODEL_PATH    Path to the model file for verification");
             eprintln!("  LLAMA_SERVER_UNIT      systemd unit name (default: llama-server)");

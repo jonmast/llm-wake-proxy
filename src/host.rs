@@ -241,12 +241,11 @@ impl HelperRpc for SshHelperRpc {
         Box::pin(async move {
             let mut state = self.ensure_started().await?;
 
-            if matches!(state.lifecycle, LifecycleState::Ready) {
-                if let Ok(status_state) = self.fetch_status().await {
+            if matches!(state.lifecycle, LifecycleState::Ready)
+                && let Ok(status_state) = self.fetch_status().await {
                     state.llama_server_unit = status_state.llama_server_unit;
                     state.inhibit_unit = status_state.inhibit_unit;
                 }
-            }
 
             Ok(state)
         })
