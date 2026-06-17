@@ -226,7 +226,14 @@ pub struct LifecycleManager<W, S, H, T, C> {
 }
 
 impl<W, S, H, T, C> LifecycleManager<W, S, H, T, C> {
-    pub fn new(wake: W, ssh: S, helper: H, tunnel: T, clock: C, initial_status: BackendStatus) -> Self {
+    pub fn new(
+        wake: W,
+        ssh: S,
+        helper: H,
+        tunnel: T,
+        clock: C,
+        initial_status: BackendStatus,
+    ) -> Self {
         Self::new_with_timing(
             wake,
             ssh,

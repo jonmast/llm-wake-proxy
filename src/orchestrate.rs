@@ -19,12 +19,17 @@ impl Orchestrator {
     }
 
     pub async fn execute(&self, kind: LifecycleRequest, body: Bytes, stream: bool) -> Response {
-        let _cold_permit = match self.acquire_cold_permit() {
+        let _cold_permit = match self.acquire_cold_permit(&kind) {
             Ok(permit) => permit,
             Err(response) => return *response,
         };
 
-        match self.state.lifecycle.ensure_backend(kind.clone()).await {
+        match self
+            .state
+            .lifecycle_for(&kind)
+            .ensure_backend(kind.clone())
+            .await
+        {
             LifecycleDecision::Ready(status) => self.handle_ready(kind, body, stream, status).await,
             LifecycleDecision::Warming {
                 retry_after_secs, ..
@@ -50,8 +55,11 @@ impl Orchestrator {
         }
     }
 
-    fn acquire_cold_permit(&self) -> Result<Option<OwnedSemaphorePermit>, Box<Response>> {
-        if self.state.is_cold() {
+    fn acquire_cold_permit(
+        &self,
+        kind: &LifecycleRequest,
+    ) -> Result<Option<OwnedSemaphorePermit>, Box<Response>> {
+        if self.state.is_cold(kind) {
             match self.state.cold_start_semaphore.clone().try_acquire_owned() {
                 Ok(permit) => Ok(Some(permit)),
                 Err(_) => Err(Box::new(openai_error(
@@ -73,12 +81,11 @@ impl Orchestrator {
         stream: bool,
         status: BackendStatus,
     ) -> Response {
-        if self.state.check_tunnel_drop(status.tunnel) {
+        if self.state.check_tunnel_drop(&kind, status.tunnel) {
             self.state.metrics.inc_tunnel_drops();
         }
 
-        if kind == LifecycleRequest::Embeddings && status.embeddings == CapabilityState::Degraded
-        {
+        if kind == LifecycleRequest::Embeddings && status.embeddings == CapabilityState::Degraded {
             return openai_error(
                 StatusCode::BAD_REQUEST,
                 "unsupported_embeddings",
@@ -106,9 +113,9 @@ impl Orchestrator {
     ) -> Response {
         let state = &self.state;
         let config = ForwardConfig {
-            port: state.config.host.tunnel_local_port,
+            port: state.tunnel_port_for(&kind),
         };
-        let model_alias = state.config.model.alias.clone();
+        let model_alias = state.model_alias_for(&kind).to_string();
 
         let forward_body = body.clone();
         let forward_config = config.clone();
@@ -150,8 +157,9 @@ impl Orchestrator {
             Ok(Err(forward::ForwardError::UpstreamUnreachable)) => {
                 state.metrics.inc_cold_starts();
                 state.metrics.inc_wake_attempts();
-                state.lifecycle.mark_warming();
-                match state.lifecycle.ensure_backend(kind).await {
+                let lifecycle = state.lifecycle_for(&kind);
+                lifecycle.mark_warming();
+                match lifecycle.ensure_backend(kind).await {
                     LifecycleDecision::Ready(_) => {
                         let cancellation = RequestCancellation::new();
                         if stream {
@@ -210,7 +218,7 @@ impl Orchestrator {
 
 async fn embedding_degradation_response(state: &AppState, reason: &str) -> Response {
     state
-        .lifecycle
+        .embeddings_lifecycle
         .degrade_embeddings(reason.to_string())
         .await;
     openai_error(
@@ -328,7 +336,10 @@ mod tests {
                 provider_id: "llama.cpp".to_string(),
                 owned_by: "test-suite".to_string(),
             },
-            embeddings: EmbeddingsConfig { enabled: true },
+            embeddings: EmbeddingsConfig {
+                enabled: true,
+                backend: None,
+            },
             warm_execution: WarmExecutionConfig::default(),
             host: HostConfig::default(),
             cold_start_max_waiting: 32,

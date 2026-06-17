@@ -34,6 +34,9 @@ All configuration is via environment variables.
 | `MODEL_OWNED_BY` | `llm-wake-proxy` | Owner string for `/v1/models` |
 | `MODEL_PROVIDER_ID` | `llama.cpp` | Provider ID for `/v1/models` |
 | `EMBEDDINGS_ENABLED` | `true` | Enable embeddings forwarding |
+| `EMBEDDINGS_MODEL_ALIAS` | `{MODEL_ALIAS}-embeddings` | Model alias for the dedicated embeddings backend (dual-backend mode, see below) |
+| `EMBEDDINGS_MODEL_OWNED_BY` | `MODEL_OWNED_BY` | Owner string for the embeddings model in `/v1/models` (dual-backend mode) |
+| `EMBEDDINGS_MODEL_PROVIDER_ID` | `MODEL_PROVIDER_ID` | Provider ID for the embeddings model in `/v1/models` (dual-backend mode) |
 | `WARM_MAX_ACTIVE_REQUESTS` | `2` | Max concurrent upstream requests |
 | `WARM_MAX_QUEUED_REQUESTS` | `16` | Max queued warm requests (0 = no queue) |
 | `WARM_QUEUE_TIMEOUT_SECS` | `30` | Max seconds a request waits in queue |
@@ -50,6 +53,9 @@ All configuration is via environment variables.
 | `MODEL_PATH` | (required) | Path to model file on host (for model verification) |
 | `TUNNEL_LOCAL_PORT` | `18080` | Local port for SSH tunnel |
 | `LLAMA_SERVER_PORT` | `8080` | Remote port on host (llama-server) |
+| `EMBEDDINGS_MODEL_PATH` | (unset) | Path to a dedicated embeddings model file on host. Setting this activates **dual-backend mode**: chat and embeddings run as separate `llama-server` processes with independent lifecycle tracking. Implies `EMBEDDINGS_ENABLED=true`, overriding any explicit `EMBEDDINGS_ENABLED=false` |
+| `EMBEDDINGS_TUNNEL_LOCAL_PORT` | `18081` | Local port for the embeddings SSH tunnel (dual-backend mode) |
+| `EMBEDDINGS_LLAMA_SERVER_PORT` | `8081` | Remote port on host for the embeddings `llama-server` (dual-backend mode) |
 
 ### Wake-on-LAN
 
@@ -77,7 +83,10 @@ The helper binary (`llm-wake-proxy-helper`) runs on the host over SSH. It provid
 llm-wake-proxy-helper status
 
 # Ensure llama-server is started (idempotent, singleton)
-EXPECTED_MODEL_PATH=/models/model.gguf llm-wake-proxy-helper ensure-started default
+EXPECTED_MODEL_PATH=/models/model.gguf llm-wake-proxy-helper ensure-started chat default
+
+# Dual-backend mode: same command, targeting the embeddings server
+EXPECTED_MODEL_PATH=/models/embed-model.gguf llm-wake-proxy-helper ensure-started embeddings embed-default
 
 # Lease management
 llm-wake-proxy-helper lease acquire --ttl 3600
@@ -89,9 +98,10 @@ All subcommands emit JSON on stdout and reserve stderr for human diagnostics.
 
 ### systemd Units
 
-The helper manages two user-level systemd units:
+The helper manages user-level systemd units:
 
 - **`llama-server.service`** — A static unit you create once. The helper starts it on demand via `systemctl --user start llama-server`. It should be **disabled** (not enabled for auto-start) so the host can sleep when idle.
+- **`llama-server-embeddings.service`** — Optional second static unit for **dual-backend mode**, used when the proxy is configured with `EMBEDDINGS_MODEL_PATH`. Same shape as `llama-server.service` but runs a dedicated embeddings model on its own port (default `8081`). Also kept **disabled**. Override the unit name/port the helper looks for via `LLAMA_SERVER_EMBEDDINGS_UNIT` / `LLAMA_SERVER_EMBEDDINGS_PORT` if you deviate from the defaults.
 - **`llm-wake-proxy-inhibit`** — A transient unit created by `systemd-run` when the proxy acquires a lease. It runs `systemd-inhibit --what=sleep` to keep the host awake while requests are active. The helper removes it when the lease is released or expires.
 
 ### Installing the llama-server unit
@@ -110,6 +120,8 @@ Then reload and **disable** it (so it only starts on-demand):
 systemctl --user daemon-reload
 systemctl --user disable llama-server.service
 ```
+
+For dual-backend mode, repeat the same steps with `llama-server-embeddings.service`, pointing `ExecStart` at your embeddings model and `--port 8081` (or whatever you set `LLAMA_SERVER_EMBEDDINGS_PORT`/`EMBEDDINGS_LLAMA_SERVER_PORT` to).
 
 If the host needs to work while nobody is logged in, enable lingering for the user:
 
@@ -228,18 +240,31 @@ curl http://localhost:8080/status
 Returns:
 ```json
 {
-  "state": "ready",
-  "model_alias": "llm-wake-proxy",
-  "capabilities": {
-    "chat": "ready",
-    "embeddings": "ready"
+  "chat": {
+    "model_alias": "llm-wake-proxy",
+    "state": "ready",
+    "capability": "ready",
+    "capability_reason": null,
+    "tunnel": "ready",
+    "last_wake_attempt_at": 1717156800,
+    "lease_expires_at": 1717158600,
+    "host_unit": {
+      "llama_server_unit": "active",
+      "inhibit_unit": "activating"
+    }
   },
-  "tunnel": "ready",
-  "last_wake_attempt_at": 1717156800,
-  "lease_expires_at": 1717158600,
-  "host_unit": {
-    "llama_server_unit": "active",
-    "inhibit_unit": "activating"
+  "embeddings": {
+    "model_alias": "llm-wake-proxy-embeddings",
+    "state": "ready",
+    "capability": "ready",
+    "capability_reason": null,
+    "tunnel": "ready",
+    "last_wake_attempt_at": 1717156800,
+    "lease_expires_at": 1717158600,
+    "host_unit": {
+      "llama_server_unit": "active",
+      "inhibit_unit": "activating"
+    }
   },
   "metrics": {
     "cold_starts": 1,
@@ -256,6 +281,8 @@ Returns:
   }
 }
 ```
+
+The `embeddings` block is `null` unless `EMBEDDINGS_ENABLED=true`. In the default (shared-backend) configuration, `chat` and `embeddings` reflect the same underlying `llama-server` process; in dual-backend mode (`EMBEDDINGS_MODEL_PATH` set) they track two independent processes with their own state, tunnel, and host units.
 
 ### State Transitions
 

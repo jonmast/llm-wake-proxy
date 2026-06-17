@@ -149,7 +149,11 @@ impl QueueTicket {
     ) -> Result<Self, WarmExecutionError> {
         let mut state = queue_state.lock().expect("queue state lock poisoned");
         if state.queued >= max_queued_requests {
-            warn!(queued = state.queued, max = max_queued_requests, "warm execution queue full");
+            warn!(
+                queued = state.queued,
+                max = max_queued_requests,
+                "warm execution queue full"
+            );
             return Err(WarmExecutionError::QueueFull);
         }
 

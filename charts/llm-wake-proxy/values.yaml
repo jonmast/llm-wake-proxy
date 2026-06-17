@@ -24,6 +24,13 @@ proxy:
   modelOwnedBy: llm-wake-proxy
   modelProviderId: llama.cpp
   embeddingsEnabled: true
+  # -- Dual-backend mode: set to run chat and embeddings on separate
+  #    llama-server processes. Leave empty to keep the default
+  #    shared-backend behaviour (one process serves both).
+  embeddingsModelPath: ""
+  embeddingsModelAlias: ""
+  embeddingsModelOwnedBy: ""
+  embeddingsModelProviderId: ""
   warmMaxActiveRequests: 2
   warmMaxQueuedRequests: 16
   warmQueueTimeoutSecs: 30
@@ -42,6 +49,9 @@ ssh:
   modelPath: ""         # required
   tunnelLocalPort: 18080
   llamaServerPort: 8080
+  # -- Dual-backend mode only: tunnel/port for the embeddings llama-server.
+  embeddingsTunnelLocalPort: 18081
+  embeddingsLlamaServerPort: 8081
   existingSecret: ""    # name of existing k8s Secret (ssh-privatekey, known_hosts)
   mountPath: /home/nonroot/.ssh
 
@@ -186,6 +196,10 @@ configMaps:
       MODEL_OWNED_BY: "{{ .Values.proxy.modelOwnedBy }}"
       MODEL_PROVIDER_ID: "{{ .Values.proxy.modelProviderId }}"
       EMBEDDINGS_ENABLED: "{{ .Values.proxy.embeddingsEnabled }}"
+      EMBEDDINGS_MODEL_PATH: "{{ .Values.proxy.embeddingsModelPath }}"
+      EMBEDDINGS_MODEL_ALIAS: "{{ .Values.proxy.embeddingsModelAlias }}"
+      EMBEDDINGS_MODEL_OWNED_BY: "{{ .Values.proxy.embeddingsModelOwnedBy }}"
+      EMBEDDINGS_MODEL_PROVIDER_ID: "{{ .Values.proxy.embeddingsModelProviderId }}"
       WARM_MAX_ACTIVE_REQUESTS: "{{ .Values.proxy.warmMaxActiveRequests }}"
       WARM_MAX_QUEUED_REQUESTS: "{{ .Values.proxy.warmMaxQueuedRequests }}"
       WARM_QUEUE_TIMEOUT_SECS: "{{ .Values.proxy.warmQueueTimeoutSecs }}"
@@ -202,6 +216,8 @@ configMaps:
       SSH_KEY_PATH: "{{ printf `%s/ssh-privatekey` .Values.ssh.mountPath }}"
       TUNNEL_LOCAL_PORT: "{{ .Values.ssh.tunnelLocalPort }}"
       LLAMA_SERVER_PORT: "{{ .Values.ssh.llamaServerPort }}"
+      EMBEDDINGS_TUNNEL_LOCAL_PORT: "{{ .Values.ssh.embeddingsTunnelLocalPort }}"
+      EMBEDDINGS_LLAMA_SERVER_PORT: "{{ .Values.ssh.embeddingsLlamaServerPort }}"
       WOL_MAC_ADDRESS: "{{ required `wol.macAddress is required` .Values.wol.macAddress }}"
       WOL_BROADCAST_ADDR: "{{ .Values.wol.broadcastAddr }}"
       WOL_PORT: "{{ .Values.wol.port }}"

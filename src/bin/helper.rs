@@ -1,6 +1,6 @@
 use std::process::ExitCode;
 
-use llm_wake_proxy::helper::{Helper, HelperConfig, HelperStatus};
+use llm_wake_proxy::helper::{Helper, HelperConfig, HelperStatus, Target};
 
 fn print_json<T: serde::Serialize>(response: &T) {
     println!("{}", serde_json::to_string(response).unwrap());
@@ -54,20 +54,39 @@ fn main() -> ExitCode {
             exit_for_status(&response.status, None)
         }
         Some("ensure-started") => {
-            let model_alias = match args.get(2) {
+            let usage = || {
+                eprintln!("Usage: helper ensure-started <chat|embeddings> <model-alias>");
+                eprintln!();
+                eprintln!("Environment:");
+                eprintln!("  EXPECTED_MODEL_PATH    Path to verify against running server");
+                eprintln!("  LLAMA_SERVER_UNIT      systemd unit name (default: llama-server)");
+                eprintln!("  LLAMA_SERVER_PORT      Port for server health check (default: 8080)");
+                eprintln!(
+                    "  LLAMA_SERVER_EMBEDDINGS_UNIT  systemd unit name (default: llama-server-embeddings)"
+                );
+                eprintln!(
+                    "  LLAMA_SERVER_EMBEDDINGS_PORT  Port for embeddings server health check (default: 8081)"
+                );
+                eprintln!("  SERVER_START_TIMEOUT_SECS  How long to wait for server (default: 60)");
+            };
+
+            let target = match args.get(2).map(|s| s.parse::<Target>()) {
+                Some(Ok(target)) => target,
+                Some(Err(e)) => {
+                    eprintln!("{e}");
+                    usage();
+                    return ExitCode::FAILURE;
+                }
+                None => {
+                    usage();
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            let model_alias = match args.get(3) {
                 Some(alias) => alias,
                 None => {
-                    eprintln!("Usage: helper ensure-started <model-alias>");
-                    eprintln!();
-                    eprintln!("Environment:");
-                    eprintln!("  EXPECTED_MODEL_PATH    Path to verify against running server");
-                    eprintln!("  LLAMA_SERVER_UNIT      systemd unit name (default: llama-server)");
-                    eprintln!(
-                        "  LLAMA_SERVER_PORT      Port for server health check (default: 8080)"
-                    );
-                    eprintln!(
-                        "  SERVER_START_TIMEOUT_SECS  How long to wait for server (default: 60)"
-                    );
+                    usage();
                     return ExitCode::FAILURE;
                 }
             };
@@ -80,7 +99,7 @@ fn main() -> ExitCode {
                 }
             };
 
-            let response = helper.ensure_started(model_alias, &model_path);
+            let response = helper.ensure_started(target, model_alias, &model_path);
             print_json(&response);
 
             match response.status {
@@ -123,16 +142,22 @@ fn main() -> ExitCode {
                     eprintln!("  inspect                  Show current lease state");
                     eprintln!();
                     eprintln!("Environment:");
-                    eprintln!("  INHIBIT_HOLDER_UNIT    systemd unit name (default: llm-wake-proxy-inhibit)");
+                    eprintln!(
+                        "  INHIBIT_HOLDER_UNIT    systemd unit name (default: llm-wake-proxy-inhibit)"
+                    );
                     ExitCode::FAILURE
                 }
             }
         }
         _ => {
             eprintln!("Usage:");
-            eprintln!("  helper status                    Show host unit and model status");
-            eprintln!("  helper ensure-started <alias>    Start and verify model server");
-            eprintln!("  helper lease <acquire|release|inspect>  Manage inhibit lease");
+            eprintln!(
+                "  helper status                              Show host unit and model status"
+            );
+            eprintln!(
+                "  helper ensure-started <chat|embeddings> <alias>  Start and verify model server"
+            );
+            eprintln!("  helper lease <acquire|release|inspect>     Manage inhibit lease");
             eprintln!();
             eprintln!("Environment:");
             eprintln!("  EXPECTED_MODEL_PATH    Path to the model file for verification");
@@ -141,6 +166,12 @@ fn main() -> ExitCode {
                 "  INHIBIT_HOLDER_UNIT    systemd unit name (default: llm-wake-proxy-inhibit)"
             );
             eprintln!("  LLAMA_SERVER_PORT      Port for server health check (default: 8080)");
+            eprintln!(
+                "  LLAMA_SERVER_EMBEDDINGS_UNIT  systemd unit name (default: llama-server-embeddings)"
+            );
+            eprintln!(
+                "  LLAMA_SERVER_EMBEDDINGS_PORT  Port for embeddings server health check (default: 8081)"
+            );
             eprintln!("  SERVER_START_TIMEOUT_SECS  How long to wait for server (default: 60)");
             ExitCode::FAILURE
         }

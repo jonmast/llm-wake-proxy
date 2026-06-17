@@ -1,10 +1,9 @@
 use std::time::Duration;
 
-use crate::helper::{HelperStatus, StatusResponse};
+use crate::helper::{HelperStatus, StatusResponse, Target, UnitInfo};
 use crate::lifecycle::{
-    CapabilityState, HelperRpc, LifecycleError, LifecycleFuture, LifecycleRequest,
-    LifecycleState, ObservedBackendState, SshReadinessProbe, TunnelOwner, TunnelState,
-    WakeRequester,
+    CapabilityState, HelperRpc, LifecycleError, LifecycleFuture, LifecycleRequest, LifecycleState,
+    ObservedBackendState, SshReadinessProbe, TunnelOwner, TunnelState, WakeRequester,
 };
 
 // ===== Wake-on-LAN =====
@@ -18,7 +17,11 @@ pub struct WolWakeRequester {
 
 impl WolWakeRequester {
     pub fn new(mac: [u8; 6], broadcast: String, port: u16) -> Self {
-        Self { mac, broadcast, port }
+        Self {
+            mac,
+            broadcast,
+            port,
+        }
     }
 }
 
@@ -93,6 +96,7 @@ pub struct SshHelperRpc {
     model_path: String,
     model_alias: String,
     ssh_key_path: String,
+    target: Target,
 }
 
 impl SshHelperRpc {
@@ -103,6 +107,7 @@ impl SshHelperRpc {
         model_path: String,
         model_alias: String,
         ssh_key_path: String,
+        target: Target,
     ) -> Self {
         Self {
             ssh_user,
@@ -111,6 +116,7 @@ impl SshHelperRpc {
             model_path,
             model_alias,
             ssh_key_path,
+            target,
         }
     }
 
@@ -154,6 +160,7 @@ impl SshHelperRpc {
                 &format!("EXPECTED_MODEL_PATH={}", self.model_path),
                 &self.helper_path,
                 "ensure-started",
+                self.target.as_str(),
                 &self.model_alias,
             ])
             .await?;
@@ -193,19 +200,14 @@ impl SshHelperRpc {
     }
 
     async fn fetch_status(&self) -> Result<ObservedBackendState, LifecycleError> {
-        let output = self
-            .run_helper_cmd(&[&self.helper_path, "status"])
-            .await?;
+        let output = self.run_helper_cmd(&[&self.helper_path, "status"]).await?;
 
         let parsed: StatusResponse = serde_json::from_str(&output)
             .map_err(|e| LifecycleError::new(format!("failed to parse status response: {e}")))?;
 
-        let llama_server_unit = map_unit_state(
-            parsed
-                .llama_server
-                .as_ref()
-                .map(|u| u.active_state.as_str()),
-        );
+        let unit = select_unit(self.target, &parsed);
+
+        let llama_server_unit = map_unit_state(unit.as_ref().map(|u| u.active_state.as_str()));
         let inhibit_unit = map_unit_state(
             parsed
                 .inhibit_holder
@@ -242,13 +244,21 @@ impl HelperRpc for SshHelperRpc {
             let mut state = self.ensure_started().await?;
 
             if matches!(state.lifecycle, LifecycleState::Ready)
-                && let Ok(status_state) = self.fetch_status().await {
-                    state.llama_server_unit = status_state.llama_server_unit;
-                    state.inhibit_unit = status_state.inhibit_unit;
-                }
+                && let Ok(status_state) = self.fetch_status().await
+            {
+                state.llama_server_unit = status_state.llama_server_unit;
+                state.inhibit_unit = status_state.inhibit_unit;
+            }
 
             Ok(state)
         })
+    }
+}
+
+fn select_unit(target: Target, status: &StatusResponse) -> &Option<UnitInfo> {
+    match target {
+        Target::Chat => &status.llama_server,
+        Target::Embeddings => &status.llama_server_embeddings,
     }
 }
 
@@ -264,8 +274,8 @@ fn map_unit_state(active_state: Option<&str>) -> crate::lifecycle::UnitState {
 
 // ===== SSH Tunnel Manager =====
 
-use tokio::sync::Mutex;
 use tokio::process::Child;
+use tokio::sync::Mutex;
 
 pub struct SshTunnelManager {
     ssh_user: String,
@@ -277,7 +287,13 @@ pub struct SshTunnelManager {
 }
 
 impl SshTunnelManager {
-    pub fn new(ssh_user: String, ssh_host: String, local_port: u16, remote_port: u16, ssh_key_path: String) -> Self {
+    pub fn new(
+        ssh_user: String,
+        ssh_host: String,
+        local_port: u16,
+        remote_port: u16,
+        ssh_key_path: String,
+    ) -> Self {
         Self {
             ssh_user,
             ssh_host,
@@ -318,9 +334,7 @@ impl SshTunnelManager {
                 "SSH tunnel exited immediately with status: {status}"
             ))),
             Ok(None) => Ok(child),
-            Err(e) => Err(LifecycleError::new(format!(
-                "failed to check tunnel: {e}"
-            ))),
+            Err(e) => Err(LifecycleError::new(format!("failed to check tunnel: {e}"))),
         }
     }
 }
@@ -363,6 +377,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn select_unit_picks_target_specific_unit() {
+        let chat_unit = UnitInfo {
+            unit_name: "llama-server".to_string(),
+            active_state: "active".to_string(),
+            sub_state: "running".to_string(),
+            description: "chat".to_string(),
+        };
+        let embeddings_unit = UnitInfo {
+            unit_name: "llama-server-embeddings".to_string(),
+            active_state: "inactive".to_string(),
+            sub_state: "dead".to_string(),
+            description: "embeddings".to_string(),
+        };
+        let status = StatusResponse {
+            status: HelperStatus::Ok,
+            message: String::new(),
+            llama_server: Some(chat_unit.clone()),
+            inhibit_holder: None,
+            active_model: None,
+            llama_server_embeddings: Some(embeddings_unit.clone()),
+            active_model_embeddings: None,
+        };
+
+        assert_eq!(
+            select_unit(Target::Chat, &status)
+                .as_ref()
+                .unwrap()
+                .unit_name,
+            chat_unit.unit_name
+        );
+        assert_eq!(
+            select_unit(Target::Embeddings, &status)
+                .as_ref()
+                .unwrap()
+                .unit_name,
+            embeddings_unit.unit_name
+        );
+    }
+
+    #[test]
     fn map_unit_state_known_values() {
         assert_eq!(
             map_unit_state(Some("active")),
@@ -380,10 +434,7 @@ mod tests {
             map_unit_state(Some("failed")),
             crate::lifecycle::UnitState::Failed
         );
-        assert_eq!(
-            map_unit_state(None),
-            crate::lifecycle::UnitState::Unknown
-        );
+        assert_eq!(map_unit_state(None), crate::lifecycle::UnitState::Unknown);
         assert_eq!(
             map_unit_state(Some("garbage")),
             crate::lifecycle::UnitState::Unknown

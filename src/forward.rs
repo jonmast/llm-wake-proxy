@@ -186,9 +186,10 @@ fn rewrite_model_alias(body: &str, alias: &str) -> String {
                 match serde_json::from_str::<Value>(sse_data) {
                     Ok(mut value) => {
                         if let Some(obj) = value.as_object_mut()
-                            && let Some(model) = obj.get_mut("model") {
-                                *model = Value::String(alias.to_string());
-                            }
+                            && let Some(model) = obj.get_mut("model")
+                        {
+                            *model = Value::String(alias.to_string());
+                        }
                         if let Ok(rewritten) = serde_json::to_string(&value) {
                             format!("data: {rewritten}")
                         } else {
@@ -204,9 +205,10 @@ fn rewrite_model_alias(body: &str, alias: &str) -> String {
             match serde_json::from_str::<Value>(clean_part) {
                 Ok(mut value) => {
                     if let Some(obj) = value.as_object_mut()
-                        && let Some(model) = obj.get_mut("model") {
-                            *model = Value::String(alias.to_string());
-                        }
+                        && let Some(model) = obj.get_mut("model")
+                    {
+                        *model = Value::String(alias.to_string());
+                    }
                     if let Ok(rewritten) = serde_json::to_string(&value) {
                         rewritten
                     } else {
@@ -245,6 +247,10 @@ mod tests {
     fn test_rewrite_model_alias_streaming() {
         let sse_chunk = r#"data: {"model":"llama-3-8b","choices":[]}"#;
         let rewritten = rewrite_model_alias(sse_chunk, "my-custom-model");
-        assert!(rewritten.contains("my-custom-model"), "Expected model to be rewritten, got: {}", rewritten);
+        assert!(
+            rewritten.contains("my-custom-model"),
+            "Expected model to be rewritten, got: {}",
+            rewritten
+        );
     }
 }

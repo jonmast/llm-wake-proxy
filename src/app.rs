@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use crate::{
     http_error::openai_error,
-    lifecycle::LifecycleRequest,
+    lifecycle::{BackendStatus, CapabilityState, LifecycleRequest},
     orchestrate::Orchestrator,
     state::AppState,
 };
@@ -110,40 +110,80 @@ async fn healthz() -> impl IntoResponse {
 }
 
 async fn status(State(state): State<AppState>) -> impl IntoResponse {
-    let backend = state.lifecycle.status();
     let metrics = state.metrics.snapshot();
 
+    let chat_status = state.chat_lifecycle.status();
+    let chat = backend_status_json(
+        &chat_status,
+        &state.config.model.alias,
+        chat_status.chat,
+        None,
+    );
+
+    let embeddings = if state.config.embeddings.enabled {
+        let embeddings_status = state.embeddings_lifecycle.status();
+        let capability = embeddings_status.embeddings;
+        let capability_reason = embeddings_status.embeddings_reason.clone();
+        Some(backend_status_json(
+            &embeddings_status,
+            state.model_alias_for(&LifecycleRequest::Embeddings),
+            capability,
+            capability_reason,
+        ))
+    } else {
+        None
+    };
+
     Json(json!({
-        "state": backend.lifecycle,
-        "model_alias": state.config.model.alias,
-        "capabilities": {
-            "chat": backend.chat,
-            "embeddings": backend.embeddings,
-            "embeddings_reason": backend.embeddings_reason,
-        },
-        "tunnel": backend.tunnel,
-        "last_wake_attempt_at": backend.last_wake_attempt_at,
-        "lease_expires_at": backend.lease_expires_at,
-        "host_unit": {
-            "llama_server_unit": backend.llama_server_unit,
-            "inhibit_unit": backend.inhibit_unit,
-        },
+        "chat": chat,
+        "embeddings": embeddings,
         "metrics": metrics,
     }))
 }
 
+fn backend_status_json(
+    status: &BackendStatus,
+    model_alias: &str,
+    capability: CapabilityState,
+    capability_reason: Option<String>,
+) -> Value {
+    json!({
+        "model_alias": model_alias,
+        "state": status.lifecycle,
+        "capability": capability,
+        "capability_reason": capability_reason,
+        "tunnel": status.tunnel,
+        "last_wake_attempt_at": status.last_wake_attempt_at,
+        "lease_expires_at": status.lease_expires_at,
+        "host_unit": {
+            "llama_server_unit": status.llama_server_unit,
+            "inhibit_unit": status.inhibit_unit,
+        },
+    })
+}
+
 async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
+    let mut data = vec![json!({
+        "id": state.config.model.alias,
+        "object": "model",
+        "created": 0,
+        "owned_by": state.config.model.owned_by,
+        "provider": state.config.model.provider_id,
+    })];
+
+    if let Some(backend) = &state.config.embeddings.backend {
+        data.push(json!({
+            "id": backend.alias,
+            "object": "model",
+            "created": 0,
+            "owned_by": backend.owned_by,
+            "provider": backend.provider_id,
+        }));
+    }
+
     Json(json!({
         "object": "list",
-        "data": [
-            {
-                "id": state.config.model.alias,
-                "object": "model",
-                "created": 0,
-                "owned_by": state.config.model.owned_by,
-                "provider": state.config.model.provider_id,
-            }
-        ]
+        "data": data,
     }))
 }
 
@@ -239,13 +279,14 @@ async fn embeddings(
         );
     }
 
-    if payload.model != state.config.model.alias {
+    let embeddings_alias = state.model_alias_for(&LifecycleRequest::Embeddings);
+    if payload.model != embeddings_alias {
         return openai_error(
             StatusCode::BAD_REQUEST,
             "model_not_found",
             format!(
                 "unsupported model '{}': expected '{}'",
-                payload.model, state.config.model.alias
+                payload.model, embeddings_alias
             ),
             None,
         );
@@ -496,10 +537,7 @@ mod tests {
             }
         }
 
-        fn degrade_embeddings(
-            &self,
-            _reason: String,
-        ) -> crate::lifecycle::LifecycleFuture<'_, ()> {
+        fn degrade_embeddings(&self, _reason: String) -> crate::lifecycle::LifecycleFuture<'_, ()> {
             Box::pin(async move {})
         }
 
@@ -516,7 +554,10 @@ mod tests {
                 provider_id: "llama.cpp".to_string(),
                 owned_by: "test-suite".to_string(),
             },
-            embeddings: EmbeddingsConfig { enabled: true },
+            embeddings: EmbeddingsConfig {
+                enabled: true,
+                backend: None,
+            },
             warm_execution: WarmExecutionConfig::default(),
             host: HostConfig::default(),
             cold_start_max_waiting: 32,
@@ -531,6 +572,35 @@ mod tests {
         AppState::with_lifecycle(
             test_config(),
             Arc::new(StaticLifecycleOrchestrator { decision }),
+        )
+    }
+
+    fn dual_mode_config() -> AppConfig {
+        use crate::config::EmbeddingsBackendConfig;
+
+        AppConfig {
+            embeddings: EmbeddingsConfig {
+                enabled: true,
+                backend: Some(EmbeddingsBackendConfig {
+                    alias: "embed-model".to_string(),
+                    provider_id: "llama.cpp".to_string(),
+                    owned_by: "test-suite".to_string(),
+                    model_path: "/models/embed.gguf".to_string(),
+                    tunnel_local_port: 18081,
+                    remote_port: 8081,
+                }),
+            },
+            ..test_config()
+        }
+    }
+
+    fn dual_mode_state(chat: LifecycleDecision, embeddings: LifecycleDecision) -> AppState {
+        AppState::with_dual_lifecycles(
+            dual_mode_config(),
+            Arc::new(StaticLifecycleOrchestrator { decision: chat }),
+            Arc::new(StaticLifecycleOrchestrator {
+                decision: embeddings,
+            }),
         )
     }
 
@@ -558,7 +628,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let status = state.lifecycle.status();
+        let status = state.chat_lifecycle.status();
         assert!(matches!(status.lifecycle, LifecycleState::Cold));
     }
 
@@ -646,12 +716,10 @@ mod tests {
             tunnel: TunnelState::Down,
             ..BackendStatus::default()
         };
-        let app = build_router(state_with_lifecycle(
-            LifecycleDecision::Warming {
-                status: warming_status,
-                retry_after_secs: 10,
-            },
-        ));
+        let app = build_router(state_with_lifecycle(LifecycleDecision::Warming {
+            status: warming_status,
+            retry_after_secs: 10,
+        }));
 
         let response = app
             .oneshot(
@@ -697,12 +765,10 @@ mod tests {
             tunnel: TunnelState::Down,
             ..BackendStatus::default()
         };
-        let app = build_router(state_with_lifecycle(
-            LifecycleDecision::Warming {
-                status: warming_status,
-                retry_after_secs: 10,
-            },
-        ));
+        let app = build_router(state_with_lifecycle(LifecycleDecision::Warming {
+            status: warming_status,
+            retry_after_secs: 10,
+        }));
 
         let response = app
             .oneshot(
@@ -727,12 +793,10 @@ mod tests {
             tunnel: TunnelState::Down,
             ..BackendStatus::default()
         };
-        let app = build_router(state_with_lifecycle(
-            LifecycleDecision::Warming {
-                status: warming_status,
-                retry_after_secs: 10,
-            },
-        ));
+        let app = build_router(state_with_lifecycle(LifecycleDecision::Warming {
+            status: warming_status,
+            retry_after_secs: 10,
+        }));
 
         let response = app
             .oneshot(
@@ -993,7 +1057,10 @@ mod tests {
                 provider_id: "llama.cpp".to_string(),
                 owned_by: "test-suite".to_string(),
             },
-            embeddings: EmbeddingsConfig { enabled: false },
+            embeddings: EmbeddingsConfig {
+                enabled: false,
+                backend: None,
+            },
             warm_execution: WarmExecutionConfig::default(),
             host: HostConfig::default(),
             cold_start_max_waiting: 32,
@@ -1044,12 +1111,10 @@ mod tests {
             tunnel: TunnelState::Down,
             ..BackendStatus::default()
         };
-        let app = build_router(state_with_lifecycle(
-            LifecycleDecision::Warming {
-                status: warming_status,
-                retry_after_secs: 10,
-            },
-        ));
+        let app = build_router(state_with_lifecycle(LifecycleDecision::Warming {
+            status: warming_status,
+            retry_after_secs: 10,
+        }));
 
         let response = app
             .oneshot(
@@ -1135,10 +1200,10 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-        assert_eq!(json["state"], "cold");
-        assert_eq!(json["model_alias"], "proxy-model");
-        assert_eq!(json["capabilities"]["chat"], "ready");
-        assert_eq!(json["capabilities"]["embeddings"], "ready");
+        assert_eq!(json["chat"]["state"], "cold");
+        assert_eq!(json["chat"]["model_alias"], "proxy-model");
+        assert_eq!(json["chat"]["capability"], "ready");
+        assert_eq!(json["embeddings"]["capability"], "ready");
     }
 
     #[tokio::test]
@@ -1168,14 +1233,14 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-        assert_eq!(json["state"], "ready");
-        assert_eq!(json["capabilities"]["chat"], "degraded");
-        assert_eq!(json["capabilities"]["embeddings_reason"], "remote disabled");
-        assert_eq!(json["tunnel"], "ready");
-        assert_eq!(json["host_unit"]["llama_server_unit"], "active");
-        assert_eq!(json["host_unit"]["inhibit_unit"], "activating");
-        assert_eq!(json["last_wake_attempt_at"], 1717156800u64);
-        assert_eq!(json["lease_expires_at"], 1717158600u64);
+        assert_eq!(json["chat"]["state"], "ready");
+        assert_eq!(json["chat"]["capability"], "degraded");
+        assert_eq!(json["embeddings"]["capability_reason"], "remote disabled");
+        assert_eq!(json["chat"]["tunnel"], "ready");
+        assert_eq!(json["chat"]["host_unit"]["llama_server_unit"], "active");
+        assert_eq!(json["chat"]["host_unit"]["inhibit_unit"], "activating");
+        assert_eq!(json["chat"]["last_wake_attempt_at"], 1717156800u64);
+        assert_eq!(json["chat"]["lease_expires_at"], 1717158600u64);
     }
 
     #[tokio::test]
@@ -1197,8 +1262,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["state"], "warming");
-        assert_eq!(json["tunnel"], "connecting");
+        assert_eq!(json["chat"]["state"], "warming");
+        assert_eq!(json["chat"]["tunnel"], "connecting");
     }
 
     #[tokio::test]
@@ -1379,5 +1444,242 @@ mod tests {
 
         let _ = release_tx.send(());
         held_slot.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn status_embeddings_block_is_null_when_disabled() {
+        let config = AppConfig {
+            embeddings: EmbeddingsConfig {
+                enabled: false,
+                backend: None,
+            },
+            ..test_config()
+        };
+        let app = build_router(AppState::new(config));
+
+        let response = app
+            .oneshot(Request::get("/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["embeddings"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn status_dual_mode_reports_independent_backends() {
+        let chat_status = BackendStatus {
+            lifecycle: LifecycleState::Ready,
+            tunnel: TunnelState::Ready,
+            ..BackendStatus::default()
+        };
+        let embeddings_status = BackendStatus {
+            lifecycle: LifecycleState::Warming,
+            tunnel: TunnelState::Connecting,
+            ..BackendStatus::default()
+        };
+        let app = build_router(dual_mode_state(
+            LifecycleDecision::Ready(chat_status),
+            LifecycleDecision::Warming {
+                status: embeddings_status,
+                retry_after_secs: 10,
+            },
+        ));
+
+        let response = app
+            .oneshot(Request::get("/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["chat"]["model_alias"], "proxy-model");
+        assert_eq!(json["chat"]["state"], "ready");
+        assert_eq!(json["chat"]["tunnel"], "ready");
+
+        assert_eq!(json["embeddings"]["model_alias"], "embed-model");
+        assert_eq!(json["embeddings"]["state"], "warming");
+        assert_eq!(json["embeddings"]["tunnel"], "connecting");
+    }
+
+    #[tokio::test]
+    async fn models_lists_two_entries_in_dual_mode() {
+        let app = build_router(dual_mode_state(
+            LifecycleDecision::Ready(BackendStatus::default()),
+            LifecycleDecision::Ready(BackendStatus::default()),
+        ));
+
+        let response = app
+            .oneshot(Request::get("/v1/models").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let data = json["data"].as_array().unwrap();
+        assert_eq!(data.len(), 2);
+        assert_eq!(data[0]["id"], "proxy-model");
+        assert_eq!(data[1]["id"], "embed-model");
+        assert_eq!(data[1]["owned_by"], "test-suite");
+        assert_eq!(data[1]["provider"], "llama.cpp");
+    }
+
+    #[tokio::test]
+    async fn embeddings_dual_mode_validates_against_dedicated_alias() {
+        let app = build_router(dual_mode_state(
+            LifecycleDecision::Ready(BackendStatus::default()),
+            LifecycleDecision::Ready(BackendStatus::default()),
+        ));
+
+        let response = app
+            .oneshot(
+                Request::post("/v1/embeddings")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model":"proxy-model","input":"hello"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["type"], "model_not_found");
+        assert_eq!(
+            json["error"]["message"],
+            "unsupported model 'proxy-model': expected 'embed-model'"
+        );
+    }
+
+    #[tokio::test]
+    async fn dual_mode_routes_chat_and_embeddings_to_independent_lifecycles() {
+        let ready_status = BackendStatus {
+            lifecycle: LifecycleState::Ready,
+            tunnel: TunnelState::Ready,
+            ..BackendStatus::default()
+        };
+        let warming_status = BackendStatus {
+            lifecycle: LifecycleState::Warming,
+            tunnel: TunnelState::Down,
+            ..BackendStatus::default()
+        };
+
+        // Chat ready, embeddings warming: each request must reflect its own
+        // backend's lifecycle, not the other's.
+        let app = build_router(dual_mode_state(
+            LifecycleDecision::Ready(ready_status.clone()),
+            LifecycleDecision::Warming {
+                status: warming_status.clone(),
+                retry_after_secs: 10,
+            },
+        ));
+
+        let chat_response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"proxy-model","messages":[{"role":"user","content":"hi"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(chat_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(chat_response.headers().get("retry-after").is_none());
+        let body = chat_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["type"], "backend_unavailable");
+
+        let embeddings_response = app
+            .oneshot(
+                Request::post("/v1/embeddings")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model":"embed-model","input":"hello"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            embeddings_response.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(embeddings_response.headers()["retry-after"], "10");
+        let body = embeddings_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["type"], "warming_up");
+
+        // Reverse: chat warming, embeddings ready.
+        let app = build_router(dual_mode_state(
+            LifecycleDecision::Warming {
+                status: warming_status,
+                retry_after_secs: 10,
+            },
+            LifecycleDecision::Ready(ready_status),
+        ));
+
+        let chat_response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"proxy-model","messages":[{"role":"user","content":"hi"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(chat_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(chat_response.headers()["retry-after"], "10");
+        let body = chat_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["type"], "warming_up");
+
+        let embeddings_response = app
+            .oneshot(
+                Request::post("/v1/embeddings")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model":"embed-model","input":"hello"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            embeddings_response.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(embeddings_response.headers().get("retry-after").is_none());
+        let body = embeddings_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["type"], "backend_unavailable");
     }
 }

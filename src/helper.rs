@@ -11,6 +11,35 @@ pub enum HelperStatus {
     Error,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    Chat,
+    Embeddings,
+}
+
+impl Target {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Target::Chat => "chat",
+            Target::Embeddings => "embeddings",
+        }
+    }
+}
+
+impl std::str::FromStr for Target {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "chat" => Ok(Target::Chat),
+            "embeddings" => Ok(Target::Embeddings),
+            other => Err(format!(
+                "unknown target '{other}', expected 'chat' or 'embeddings'"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnitInfo {
     pub unit_name: String,
@@ -35,6 +64,10 @@ pub struct StatusResponse {
     pub llama_server: Option<UnitInfo>,
     pub inhibit_holder: Option<UnitInfo>,
     pub active_model: Option<ModelInfo>,
+    #[serde(default)]
+    pub llama_server_embeddings: Option<UnitInfo>,
+    #[serde(default)]
+    pub active_model_embeddings: Option<ModelInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -218,6 +251,8 @@ pub struct HelperConfig {
     pub llama_server_unit: String,
     pub inhibit_holder_unit: String,
     pub llama_server_port: u16,
+    pub llama_server_embeddings_unit: String,
+    pub llama_server_embeddings_port: u16,
     pub server_start_timeout_secs: u64,
 }
 
@@ -227,6 +262,8 @@ impl Default for HelperConfig {
             llama_server_unit: "llama-server".to_string(),
             inhibit_holder_unit: "llm-wake-proxy-inhibit".to_string(),
             llama_server_port: 8080,
+            llama_server_embeddings_unit: "llama-server-embeddings".to_string(),
+            llama_server_embeddings_port: 8081,
             server_start_timeout_secs: 60,
         }
     }
@@ -243,10 +280,30 @@ impl HelperConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(8080),
+            llama_server_embeddings_unit: std::env::var("LLAMA_SERVER_EMBEDDINGS_UNIT")
+                .unwrap_or_else(|_| "llama-server-embeddings".to_string()),
+            llama_server_embeddings_port: std::env::var("LLAMA_SERVER_EMBEDDINGS_PORT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8081),
             server_start_timeout_secs: std::env::var("SERVER_START_TIMEOUT_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60),
+        }
+    }
+
+    pub fn unit_for(&self, target: Target) -> &str {
+        match target {
+            Target::Chat => &self.llama_server_unit,
+            Target::Embeddings => &self.llama_server_embeddings_unit,
+        }
+    }
+
+    pub fn port_for(&self, target: Target) -> u16 {
+        match target {
+            Target::Chat => self.llama_server_port,
+            Target::Embeddings => self.llama_server_embeddings_port,
         }
     }
 }
@@ -277,9 +334,27 @@ impl Helper {
     pub fn status(&self) -> StatusResponse {
         let llama_server = self.collect_unit_info(&self.config.llama_server_unit);
         let inhibit_holder = self.collect_unit_info(&self.config.inhibit_holder_unit);
+        let active_model = self.active_model_for(self.config.llama_server_port);
 
-        let active_model = if self.is_server_alive() {
-            match self.check_model_identity() {
+        let llama_server_embeddings =
+            self.collect_unit_info(&self.config.llama_server_embeddings_unit);
+        let active_model_embeddings =
+            self.active_model_for(self.config.llama_server_embeddings_port);
+
+        StatusResponse {
+            status: HelperStatus::Ok,
+            message: "current host unit state".to_string(),
+            llama_server,
+            inhibit_holder,
+            active_model,
+            llama_server_embeddings,
+            active_model_embeddings,
+        }
+    }
+
+    fn active_model_for(&self, port: u16) -> Option<ModelInfo> {
+        if self.is_server_alive(port) {
+            match self.check_model_identity(port) {
                 Ok(reported_id) => Some(ModelInfo {
                     model_alias: reported_id.as_deref().unwrap_or_default().to_string(),
                     model_path: reported_id.unwrap_or_default(),
@@ -297,21 +372,20 @@ impl Helper {
             }
         } else {
             None
-        };
-
-        StatusResponse {
-            status: HelperStatus::Ok,
-            message: "current host unit state".to_string(),
-            llama_server,
-            inhibit_holder,
-            active_model,
         }
     }
 
-    pub fn ensure_started(&self, model_alias: &str, model_path: &str) -> EnsureStartedResponse {
+    pub fn ensure_started(
+        &self,
+        target: Target,
+        model_alias: &str,
+        model_path: &str,
+    ) -> EnsureStartedResponse {
+        let unit = self.config.unit_for(target);
+        let port = self.config.port_for(target);
         let mut startup_triggered = false;
 
-        let is_active = match self.sys.is_active(&self.config.llama_server_unit) {
+        let is_active = match self.sys.is_active(unit) {
             Ok(active) => active,
             Err(e) => {
                 eprintln!("Failed to check unit state: {e}");
@@ -320,8 +394,8 @@ impl Helper {
         };
 
         if !is_active {
-            eprintln!("Starting systemd unit: {}", self.config.llama_server_unit);
-            match self.sys.start_unit(&self.config.llama_server_unit) {
+            eprintln!("Starting systemd unit: {unit}");
+            match self.sys.start_unit(unit) {
                 Ok(()) => startup_triggered = true,
                 Err(e) => {
                     return EnsureStartedResponse {
@@ -333,7 +407,7 @@ impl Helper {
                         server_ready: false,
                         model_verified: false,
                         llama_server: Some(UnitInfo {
-                            unit_name: self.config.llama_server_unit.clone(),
+                            unit_name: unit.to_string(),
                             active_state: "failed".to_string(),
                             sub_state: "startup_error".to_string(),
                             description: e,
@@ -343,17 +417,15 @@ impl Helper {
             }
         }
 
-        let server_ready = self.wait_for_server(self.config.server_start_timeout_secs);
+        let server_ready = self.wait_for_server(port, self.config.server_start_timeout_secs);
 
         if !server_ready {
-            let unit_info = self
-                .collect_unit_info(&self.config.llama_server_unit)
-                .unwrap_or(UnitInfo {
-                    unit_name: self.config.llama_server_unit.clone(),
-                    active_state: "unknown".to_string(),
-                    sub_state: "server_not_responding".to_string(),
-                    description: String::new(),
-                });
+            let unit_info = self.collect_unit_info(unit).unwrap_or(UnitInfo {
+                unit_name: unit.to_string(),
+                active_state: "unknown".to_string(),
+                sub_state: "server_not_responding".to_string(),
+                description: String::new(),
+            });
             return EnsureStartedResponse {
                 status: HelperStatus::Error,
                 message: format!(
@@ -369,19 +441,17 @@ impl Helper {
             };
         }
 
-        let model_verified = match self.check_model_identity() {
+        let model_verified = match self.check_model_identity(port) {
             Ok(Some(reported_id)) => {
                 if reported_id.contains(model_path) || model_path.contains(&reported_id) {
                     true
                 } else {
-                    let unit_info = self
-                        .collect_unit_info(&self.config.llama_server_unit)
-                        .unwrap_or(UnitInfo {
-                            unit_name: self.config.llama_server_unit.clone(),
-                            active_state: "active".to_string(),
-                            sub_state: "running".to_string(),
-                            description: String::new(),
-                        });
+                    let unit_info = self.collect_unit_info(unit).unwrap_or(UnitInfo {
+                        unit_name: unit.to_string(),
+                        active_state: "active".to_string(),
+                        sub_state: "running".to_string(),
+                        description: String::new(),
+                    });
                     return EnsureStartedResponse {
                         status: HelperStatus::Mismatch,
                         message: format!(
@@ -397,14 +467,12 @@ impl Helper {
                 }
             }
             Ok(None) => {
-                let unit_info = self
-                    .collect_unit_info(&self.config.llama_server_unit)
-                    .unwrap_or(UnitInfo {
-                        unit_name: self.config.llama_server_unit.clone(),
-                        active_state: "active".to_string(),
-                        sub_state: "running".to_string(),
-                        description: String::new(),
-                    });
+                let unit_info = self.collect_unit_info(unit).unwrap_or(UnitInfo {
+                    unit_name: unit.to_string(),
+                    active_state: "active".to_string(),
+                    sub_state: "running".to_string(),
+                    description: String::new(),
+                });
                 return EnsureStartedResponse {
                     status: HelperStatus::Error,
                     message: "server responded but returned no model identifiers".to_string(),
@@ -417,14 +485,12 @@ impl Helper {
                 };
             }
             Err(e) => {
-                let unit_info = self
-                    .collect_unit_info(&self.config.llama_server_unit)
-                    .unwrap_or(UnitInfo {
-                        unit_name: self.config.llama_server_unit.clone(),
-                        active_state: "unknown".to_string(),
-                        sub_state: "model_identity_check_error".to_string(),
-                        description: e.clone(),
-                    });
+                let unit_info = self.collect_unit_info(unit).unwrap_or(UnitInfo {
+                    unit_name: unit.to_string(),
+                    active_state: "unknown".to_string(),
+                    sub_state: "model_identity_check_error".to_string(),
+                    description: e.clone(),
+                });
                 return EnsureStartedResponse {
                     status: HelperStatus::Error,
                     message: format!("model identity check failed: {e}"),
@@ -438,14 +504,12 @@ impl Helper {
             }
         };
 
-        let unit_info = self
-            .collect_unit_info(&self.config.llama_server_unit)
-            .unwrap_or(UnitInfo {
-                unit_name: self.config.llama_server_unit.clone(),
-                active_state: "active".to_string(),
-                sub_state: "running".to_string(),
-                description: String::new(),
-            });
+        let unit_info = self.collect_unit_info(unit).unwrap_or(UnitInfo {
+            unit_name: unit.to_string(),
+            active_state: "active".to_string(),
+            sub_state: "running".to_string(),
+            description: String::new(),
+        });
 
         EnsureStartedResponse {
             status: HelperStatus::Ok,
@@ -593,15 +657,15 @@ impl Helper {
         }
     }
 
-    fn is_server_alive(&self) -> bool {
-        let url = build_server_url(self.config.llama_server_port, "/v1/models");
+    fn is_server_alive(&self, port: u16) -> bool {
+        let url = build_server_url(port, "/v1/models");
         self.http.get_text(&url).is_ok()
     }
 
-    fn wait_for_server(&self, timeout_secs: u64) -> bool {
+    fn wait_for_server(&self, port: u16, timeout_secs: u64) -> bool {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
         while std::time::Instant::now() < deadline {
-            if self.is_server_alive() {
+            if self.is_server_alive(port) {
                 return true;
             }
             std::thread::sleep(std::time::Duration::from_millis(500));
@@ -609,8 +673,8 @@ impl Helper {
         false
     }
 
-    fn check_model_identity(&self) -> Result<Option<String>, String> {
-        let url = build_server_url(self.config.llama_server_port, "/v1/models");
+    fn check_model_identity(&self, port: u16) -> Result<Option<String>, String> {
+        let url = build_server_url(port, "/v1/models");
         let body = self.http.get_text(&url)?;
         let json: serde_json::Value = serde_json::from_str(&body)
             .map_err(|e| format!("failed to parse models response: {e}"))?;
@@ -652,6 +716,8 @@ mod tests {
                 ready: true,
                 reported_id: Some("/models/llama-3.2-3b.Q4_K_M.gguf".to_string()),
             }),
+            llama_server_embeddings: None,
+            active_model_embeddings: None,
         };
 
         let json = serde_json::to_value(&response).unwrap();
@@ -673,6 +739,8 @@ mod tests {
             llama_server: None,
             inhibit_holder: None,
             active_model: None,
+            llama_server_embeddings: None,
+            active_model_embeddings: None,
         };
 
         let json = serde_json::to_value(&response).unwrap();
@@ -797,7 +865,33 @@ mod tests {
         assert_eq!(config.llama_server_unit, "llama-server");
         assert_eq!(config.inhibit_holder_unit, "llm-wake-proxy-inhibit");
         assert_eq!(config.llama_server_port, 8080);
+        assert_eq!(
+            config.llama_server_embeddings_unit,
+            "llama-server-embeddings"
+        );
+        assert_eq!(config.llama_server_embeddings_port, 8081);
         assert_eq!(config.server_start_timeout_secs, 60);
+    }
+
+    #[test]
+    fn helper_config_unit_for_and_port_for() {
+        let config = HelperConfig::default();
+        assert_eq!(config.unit_for(Target::Chat), "llama-server");
+        assert_eq!(
+            config.unit_for(Target::Embeddings),
+            "llama-server-embeddings"
+        );
+        assert_eq!(config.port_for(Target::Chat), 8080);
+        assert_eq!(config.port_for(Target::Embeddings), 8081);
+    }
+
+    #[test]
+    fn target_as_str_and_from_str() {
+        assert_eq!(Target::Chat.as_str(), "chat");
+        assert_eq!(Target::Embeddings.as_str(), "embeddings");
+        assert_eq!("chat".parse::<Target>(), Ok(Target::Chat));
+        assert_eq!("embeddings".parse::<Target>(), Ok(Target::Embeddings));
+        assert!("bogus".parse::<Target>().is_err());
     }
 
     #[test]
@@ -835,7 +929,11 @@ mod tests {
 
         let helper = Helper::with_services(config, Box::new(ReadySystemd), Box::new(ReadyServer));
 
-        let response = helper.ensure_started("llama-3.2-3b", "/models/llama-3.2-3b.Q4_K_M.gguf");
+        let response = helper.ensure_started(
+            Target::Chat,
+            "llama-3.2-3b",
+            "/models/llama-3.2-3b.Q4_K_M.gguf",
+        );
 
         assert_eq!(response.status, HelperStatus::Ok);
         assert!(!response.startup_triggered);
@@ -915,7 +1013,11 @@ mod tests {
             }),
         );
 
-        let response = helper.ensure_started("llama-3.2-3b", "/models/llama-3.2-3b.Q4_K_M.gguf");
+        let response = helper.ensure_started(
+            Target::Chat,
+            "llama-3.2-3b",
+            "/models/llama-3.2-3b.Q4_K_M.gguf",
+        );
 
         assert_eq!(response.status, HelperStatus::Ok);
         assert!(response.startup_triggered);
@@ -963,7 +1065,11 @@ mod tests {
             Box::new(WrongModelServer),
         );
 
-        let response = helper.ensure_started("llama-3.2-3b", "/models/llama-3.2-3b.Q4_K_M.gguf");
+        let response = helper.ensure_started(
+            Target::Chat,
+            "llama-3.2-3b",
+            "/models/llama-3.2-3b.Q4_K_M.gguf",
+        );
 
         assert_eq!(response.status, HelperStatus::Mismatch);
         assert!(response.server_ready);
@@ -1004,7 +1110,7 @@ mod tests {
         let helper =
             Helper::with_services(config, Box::new(FailingSystemd), Box::new(UnusedServer));
 
-        let response = helper.ensure_started("test-model", "/models/test.gguf");
+        let response = helper.ensure_started(Target::Chat, "test-model", "/models/test.gguf");
 
         assert_eq!(response.status, HelperStatus::Error);
         assert!(!response.startup_triggered);
@@ -1048,7 +1154,7 @@ mod tests {
         let helper =
             Helper::with_services(config, Box::new(StuckSystemd), Box::new(NeverReadyServer));
 
-        let response = helper.ensure_started("test-model", "/models/test.gguf");
+        let response = helper.ensure_started(Target::Chat, "test-model", "/models/test.gguf");
 
         assert_eq!(response.status, HelperStatus::Error);
         assert!(!response.server_ready);
